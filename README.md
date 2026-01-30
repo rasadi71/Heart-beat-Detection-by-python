@@ -2,7 +2,7 @@ Webcam-Based Heart Rate Detection using rPPG
 
 This project implements a non-contact, real-time heart rate detection system using a standard webcam.
 The system estimates heart rate by analyzing subtle color variations on the human face, caused by blood flow, using remote Photoplethysmography (rPPG) techniques.
-## thiis is a repsesentation of a research paper .
+## this is a repsesentation of a research paper .
 
 
 📌 Project Overview
