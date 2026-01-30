@@ -1,0 +1,105 @@
+import cv2
+import numpy as np
+from scipy.signal import butter, filtfilt
+from scipy.fft import fft, fftfreq
+from cvzone.FaceDetectionModule import FaceDetector
+import time
+
+# ---------------- PARAMETERS ----------------
+LOW_FREQ = 1.0        # Hz (60 BPM)
+HIGH_FREQ = 2.0       # Hz (120 BPM)
+AMPLIFICATION = 170
+FPS = 30
+BUFFER_SIZE = 150     # ~5 seconds
+# -------------------------------------------
+
+# Butterworth bandpass filter
+def bandpass_filter(signal, low, high, fs, order=5):
+    nyq = 0.5 * fs
+    low /= nyq
+    high /= nyq
+    b, a = butter(order, [low, high], btype='band')
+    return filtfilt(b, a, signal)
+
+# Webcam & face detector
+cap = cv2.VideoCapture(1)
+detector = FaceDetector(minDetectionCon=0.7)
+
+signal_buffer = []
+time_buffer = []
+
+start_time = time.time()
+
+while True:
+    success, frame = cap.read()
+    if not success:
+        break
+
+    frame = cv2.flip(frame, 1)
+    frame, faces = detector.findFaces(frame, draw=False)
+
+    bpm = "--"
+
+    if faces:
+        face = faces[0]
+        x, y, w, h = face["bbox"]
+
+
+        fx = x + int(0.25 * w)
+        fy = y + int(0.10 * h)
+        fw = int(0.5 * w)
+        fh = int(0.20 * h)
+
+        roi = frame[fy:fy+fh, fx:fx+fw]
+        cv2.rectangle(frame, (fx, fy), (fx+fw, fy+fh), (0, 255, 0), 2)
+
+        if roi.size != 0:
+            # Gaussian Pyramid (1 level)
+            roi_blur = cv2.pyrDown(roi)
+
+            # Green channel average
+            green_mean = np.mean(roi_blur[:, :, 1])
+
+            signal_buffer.append(green_mean)
+            time_buffer.append(time.time() - start_time)
+
+            if len(signal_buffer) > BUFFER_SIZE:
+                signal_buffer.pop(0)
+                time_buffer.pop(0)
+
+            # --------- SIGNAL PROCESSING ---------
+            if len(signal_buffer) >= BUFFER_SIZE:
+                sig = np.array(signal_buffer)
+
+                # Remove DC component
+                sig = sig - np.mean(sig)
+
+                # Bandpass filtering
+                filtered = bandpass_filter(sig, LOW_FREQ, HIGH_FREQ, FPS)
+
+                # Amplification
+                amplified = filtered * AMPLIFICATION
+
+                # FFT
+                N = len(amplified)
+                fft_vals = np.abs(fft(amplified))
+                freqs = fftfreq(N, d=1/FPS)
+
+                # Consider only heart-rate range
+                idx = np.where((freqs >= LOW_FREQ) & (freqs <= HIGH_FREQ))
+                peak_freq = freqs[idx][np.argmax(fft_vals[idx])]
+
+                bpm = int(60 * peak_freq)
+
+    # --------- DISPLAY ---------
+    cv2.putText(frame, f"Heart Rate: {bpm} BPM",
+                (30, 50), cv2.FONT_HERSHEY_SIMPLEX,
+                1, (0, 0, 255), 2)
+
+    cv2.imshow("Heart Beat Detection", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
