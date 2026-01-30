@@ -5,7 +5,7 @@ The system estimates heart rate by analyzing subtle color variations on the huma
 ## this is a repsesentation of a research paper .
 
 
-📌 Project Overview
+# 📌 Project Overview
 
 Traditional heart rate measurement requires physical contact with sensors.
 This project removes that requirement by using:
@@ -18,7 +18,7 @@ Signal processing techniques to extract heart rate information
 
 The heart rate is calculated in beats per minute (BPM) and displayed in real time.
 
-🧠 Working Principle
+# 🧠 Working Principle
 
 The system follows these steps:
 
@@ -58,7 +58,7 @@ BPM = 60 × Frequency (Hz)
 Real-Time Display
 The estimated heart rate is displayed on the video feed.
 
-🛠️ Technologies Used
+# 🛠️ Technologies Used
 
 Python 3
 
@@ -72,19 +72,14 @@ cvzone
 
 Webcam
 
-📦 Installation
 
-Clone the repository:
-
-git clone https://github.com/your-username/heart-rate-detection-webcam.git
-cd heart-rate-detection-webcam
 
 
 Install required dependencies:
 
 pip install opencv-python numpy scipy cvzone
 
-▶️ How to Run
+# ▶️ How to Run
 
 Run the main script:
 
@@ -103,7 +98,7 @@ Heart rate is displayed as BPM on the screen
 
 Real-time heart rate estimation
 
-⚠️ Limitations
+# ⚠️ Limitations
 
 Sensitive to head movement
 
@@ -113,7 +108,7 @@ Accuracy depends on camera frame rate
 
 Not suitable for medical diagnosis
 
-📚 Applications
+# 📚 Applications
 
 Academic research
 
@@ -123,7 +118,7 @@ Computer vision projects
 
 Remote physiological monitoring studies
 
-🔮 Future Improvements
+# 🔮 Future Improvements
 
 Motion compensation
 
@@ -135,11 +130,11 @@ Machine learning-based heart rate estimation
 
 Mobile camera support
 
-📜 License
+# 📜 License
 
 This project is released for educational and research use only.
 
-🙌 Acknowledgements
+# 🙌 Acknowledgements
 
 OpenCV community
 
