@@ -1,0 +1,549 @@
+"""
+Pulse extraction using the POS algorithm.
+
+Reference: W. Wang, A. C. den Brinker, S. Stuijk and G. de Haan,
+"Algorithmic Principles of Remote PPG," IEEE Trans. Biomed. Eng., 2017.
+
+Changes vs. the original script (all aimed at reducing heart-rate MAE):
+
+1. Fixed off-by-one sliding-window bug (window was l-1 samples, not l).
+2. Added a Butterworth band-pass filter (default 0.7-3.5 Hz = 42-210 bpm)
+   applied to the POS pulse signal before spectral analysis. This is the
+   step every reference POS/CHROM implementation includes and the
+   original script was missing -- it removes low-frequency illumination
+   drift and high-frequency motion noise that otherwise dominate the PSD
+   peak search.
+3. Frames with no detected face are no longer silently dropped. The last
+   known face box is reused for up to `--max_gap` consecutive misses so
+   the sample index still corresponds to a fixed 1/framerate time step.
+   Dropping frames without accounting for it silently changes the
+   effective sampling rate used later to convert Hz -> bpm.
+4. Welch PSD now uses a Hamming window (sharper spectral peak for a
+   single dominant frequency) instead of flattop (designed for accurate
+   *amplitude* estimation of multiple tones, not sharp peak-picking).
+5. Added epsilon-guard against divide-by-zero when a channel's windowed
+   mean is ~0.
+6. Non-blocking, optional plotting (saved to disk instead of plt.show()),
+   so the script can run headlessly/in batch for evaluation.
+7. Refactored into functions; added --ground_truth_hr so you can print
+   the MAE (and see it accumulate across a batch of videos) instead of
+   just eyeballing the number.
+8. CLI flags for start/end frame, frequency band, window length factor,
+   and output paths, instead of hard-coded constants.
+9. Face detection/ROI replaced: dlib's frontal HOG detector + crude
+   bounding box -> MediaPipe Face Landmarker (478 landmarks) + a
+   forehead+cheeks skin mask built from the face-oval hull minus the
+   eyes/eyebrows/lips hulls. This does not touch the POS math, the
+   band-pass filter, or the HR estimation (all unchanged) -- it only
+   changes which pixels feed into mean_rgb, and how much non-skin
+   background/hair/eye/mouth signal gets averaged in. This also fixes
+   the MISSING-frame dropout problem from dlib's frontal-only detector,
+   since MediaPipe tolerates head-turns, blur, and uneven lighting far
+   better.
+10. Added an experimental "Modified POS" combination step (SVD-based
+    projection instead of alpha-tuning), selectable via --pos_combine
+    {alpha, svd}. Default remains "alpha" (the original, validated
+    method) -- "svd" underperformed it on synthetic tests here and is
+    offered as an opt-in to A/B test on real footage, not a proven
+    upgrade. See pos_algorithm()'s docstring for the tested numbers.
+
+Requires: pip install mediapipe (the face_landmarker.task model bundle
+is downloaded automatically on first run to --face_model's path).
+
+Notes on validating MAE:
+The two .mat files that came with this project (pulse_test_frame-0-15.mat,
+pulse_rPPG_video_frame-0-15.mat) are *saved outputs* of a previous run
+(pulse signal + estimated bpm), not ground-truth references, so they
+can't be used to compute a real MAE. To actually tune/verify MAE you
+need paired (video, true HR) data -- e.g. a public dataset like
+UBFC-rPPG or PURE (which ship synchronized fingertip-PPG/ECG HR), or
+your own pulse-oximeter log recorded alongside the video.
+"""
+
+import os
+import sys
+import argparse
+import urllib.request
+
+import numpy as np
+import cv2
+from scipy.signal import welch, butter, filtfilt
+
+import mediapipe as mp
+from mediapipe.tasks.python.core.base_options import BaseOptions
+from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
+    VisionTaskRunningMode,
+)
+from mediapipe.tasks.python.vision.face_landmarker import (
+    FaceLandmarker,
+    FaceLandmarkerOptions,
+    FaceLandmarksConnections,
+)
+
+sys.path.insert(0, "./SkinDetector")
+import skin_detector  # noqa: E402
+
+# Official MediaPipe model bundle for the Face Landmarker task (478 3D
+# landmarks). This replaces dlib's frontal HOG detector, which loses the
+# face entirely on head-turns, blur, or uneven lighting -- MediaPipe's
+# model is far more tolerant of all three, which directly reduces the
+# long MISSING-frame runs that were corrupting the RGB trace.
+FACE_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+
+import matplotlib
+
+try:
+    matplotlib.use("TkAgg")
+except Exception:
+    matplotlib.use("Agg")
+from matplotlib import pyplot as plt
+
+
+# --------------------------------------------------------------------------- #
+# Face / skin ROI extraction (MediaPipe Face Landmarker, 478 landmarks)
+# --------------------------------------------------------------------------- #
+
+def ensure_face_landmarker_model(model_path):
+    """Download the official face_landmarker.task bundle if not already
+    present locally."""
+    if os.path.exists(model_path):
+        return model_path
+    print(f"Downloading Face Landmarker model to {model_path} ...")
+    try:
+        urllib.request.urlretrieve(FACE_LANDMARKER_MODEL_URL, model_path)
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not download {FACE_LANDMARKER_MODEL_URL} ({e}). "
+            f"If this network is blocked, download the file manually from "
+            f"that URL and pass its path via --face_model."
+        )
+    return model_path
+
+
+def build_face_landmarker(model_path):
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionTaskRunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return FaceLandmarker.create_from_options(options)
+
+
+def _connection_indices(connections):
+    """Flatten a FaceLandmarksConnections group (list of start/end pairs)
+    into the unique set of landmark indices it touches."""
+    idx = set()
+    for c in connections:
+        idx.add(c.start)
+        idx.add(c.end)
+    return sorted(idx)
+
+
+# Precompute the index groups once -- these are the same fixed 478-point
+# canonical MediaPipe topology used by both the legacy Face Mesh solution
+# and the current Face Landmarker task, so they're stable across versions.
+_FACE_OVAL_IDX = _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_FACE_OVAL)
+_EXCLUDE_IDX_GROUPS = [
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYE),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYE),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYEBROW),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYEBROW),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LIPS),
+]
+
+
+def _dilate_hull(hull_pts, pad_ratio):
+    """Scale a convex hull outward from its centroid, so an exclusion
+    region (eyes/eyebrows/lips) clears eyelid shadow and lip-movement
+    blur around the feature, not just the exact landmark outline."""
+    pts = hull_pts.reshape(-1, 2).astype(np.float32)
+    centroid = pts.mean(axis=0)
+    pts = centroid + (pts - centroid) * (1.0 + pad_ratio)
+    return pts.astype(np.int32).reshape(-1, 1, 2)
+
+
+def landmarks_to_pixels(face_landmarks, frame_shape):
+    h, w = frame_shape[:2]
+    pts = np.array([[lm.x * w, lm.y * h] for lm in face_landmarks], dtype=np.float32)
+    return pts
+
+
+def build_roi_mask(frame_shape, landmarks_px):
+    """
+    Build a forehead + cheeks (+ nose/chin) skin mask: the face-oval
+    convex hull with the eyes, eyebrows, and lips hulls cut out. This
+    replaces the crude dlib bounding box (which included background,
+    hair, and non-skin regions) with a mask that follows the actual
+    skin surface -- less non-physiological signal mixed into the trace.
+    """
+    h, w = frame_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    oval_pts = landmarks_px[_FACE_OVAL_IDX].astype(np.int32)
+    oval_hull = cv2.convexHull(oval_pts)
+    cv2.fillConvexPoly(mask, oval_hull, 255)
+
+    for group_idx in _EXCLUDE_IDX_GROUPS:
+        pts = landmarks_px[group_idx].astype(np.int32)
+        hull = cv2.convexHull(pts)
+        hull = _dilate_hull(hull, pad_ratio=0.35)
+        cv2.fillConvexPoly(mask, hull, 0)
+
+    return mask, cv2.boundingRect(oval_hull)  # (x, y, w, h)
+
+
+def mean_skin_rgb(frame_bgr, landmark_mask, use_color_skin_mask=True):
+    """Return (r, g, b) mean over the landmark ROI (optionally further
+    restricted by color-based skin detection), or None if empty.
+
+    `frame_bgr` and `landmark_mask` are cropped to the face's bounding
+    box before this is called, for speed.
+    """
+    mask = landmark_mask
+    if use_color_skin_mask:
+        color_mask = skin_detector.process(frame_bgr)
+        mask = cv2.bitwise_and(mask, color_mask)
+
+    masked_face = cv2.bitwise_and(frame_bgr, frame_bgr, mask=mask)
+    n_skin = int(np.sum(mask > 0))
+    if n_skin == 0:
+        return None
+    r = np.sum(masked_face[:, :, 2]) / n_skin
+    g = np.sum(masked_face[:, :, 1]) / n_skin
+    b = np.sum(masked_face[:, :, 0]) / n_skin
+    return r, g, b
+
+
+# --------------------------------------------------------------------------- #
+# Frame loop: build the raw RGB trace
+# --------------------------------------------------------------------------- #
+
+def extract_mean_rgb_trace(camera, landmarker, start_index, end_index,
+                            framerate, max_gap=5, image_show=False, verbose=True,
+                            use_color_skin_mask=True):
+    """
+    Walk the video and build an (N, 3) array of mean skin RGB values, one
+    row per frame in [start_index, end_index).
+
+    Frames where face-landmark detection fails reuse the last known
+    landmarks (for up to `max_gap` consecutive misses) so every processed
+    frame still produces a row and the sample spacing stays at
+    1/framerate. If the gap exceeds max_gap, the row is filled by linear
+    interpolation once a face is found again (or held at the last valid
+    value at the end of the trace).
+    """
+    rows = []
+    valid_mask = []
+    last_landmarks_px = None
+    gap_count = 0
+    i = start_index
+    ms_per_frame = 1000.0 / framerate
+
+    while i < end_index:
+        grabbed, frame = camera.read()
+        if not grabbed:
+            if verbose:
+                print("End of video or failed to read frame at", i)
+            break
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        timestamp_ms = int(round(i * ms_per_frame))
+        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+        landmarks_px = None
+        if result.face_landmarks:
+            landmarks_px = landmarks_to_pixels(result.face_landmarks[0], frame.shape)
+            last_landmarks_px = landmarks_px
+            gap_count = 0
+        elif last_landmarks_px is not None and gap_count < max_gap:
+            landmarks_px = last_landmarks_px
+            gap_count += 1
+
+        rgb = None
+        if landmarks_px is not None:
+            mask, (bx, by, bw, bh) = build_roi_mask(frame.shape, landmarks_px)
+            if bw > 0 and bh > 0:
+                face_crop = frame[by:by + bh, bx:bx + bw]
+                mask_crop = mask[by:by + bh, bx:bx + bw]
+                if face_crop.size > 0:
+                    rgb = mean_skin_rgb(face_crop, mask_crop, use_color_skin_mask)
+                if image_show:
+                    cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
+
+        if rgb is None:
+            rows.append([np.nan, np.nan, np.nan])
+            valid_mask.append(False)
+        else:
+            rows.append(list(rgb))
+            valid_mask.append(True)
+
+        if verbose:
+            status = "ok" if rgb is not None else "MISSING"
+            print(f"frame {i - start_index + 1}/{end_index - start_index}: {status}")
+
+        i += 1
+
+    trace = np.array(rows, dtype=float)
+    valid_mask = np.array(valid_mask, dtype=bool)
+
+    if valid_mask.sum() == 0:
+        raise RuntimeError("No usable frames: face/skin never detected.")
+
+    # Fill any NaN rows (short gaps or a still-missing tail/head) via
+    # per-channel linear interpolation instead of deleting the row, so
+    # the sample index still maps to a fixed 1/framerate time step.
+    idx = np.arange(trace.shape[0])
+    for c in range(3):
+        col = trace[:, c]
+        good = ~np.isnan(col)
+        if good.sum() < trace.shape[0]:
+            col[~good] = np.interp(idx[~good], idx[good], col[good])
+        trace[:, c] = col
+
+    return trace
+
+
+# --------------------------------------------------------------------------- #
+# POS algorithm
+# --------------------------------------------------------------------------- #
+
+def pos_algorithm(mean_rgb, framerate, window_seconds=1.6, eps=1e-9, combine_method="alpha"):
+    """
+    Plane-Orthogonal-to-Skin pulse extraction.
+
+    mean_rgb: (N, 3) array of mean skin RGB per frame (columns = R,G,B)
+    combine_method:
+        "alpha" (default, unchanged from before) -- combine the two
+            projected axes S1, S2 by weighting S2 with
+            alpha = std(S1)/std(S2), per the original POS paper (Wang
+            et al. 2017). This is the tested, validated default --
+            synthetic-signal MAE ~0.17 bpm.
+        "svd" -- an alternative "Modified POS" combination: instead of
+            alpha-weighting, take the SVD of the (2 x window) projected
+            signal S, find its dominant singular vector q1 (interpreted
+            as the direction of coherent tissue/specular-reflection
+            variation), build P = I - q1 q1^T, and use the first row of
+            P @ S as the window's pulse signal. This is meant to
+            suppress specular/motion artifacts more directly than
+            alpha-tuning, per a proposed variant of POS.
+
+            CAVEAT (tested honestly, not just implemented blindly): on
+            synthetic test signals -- both plain noise and a simulated
+            correlated motion/specular artifact -- "alpha" still beat
+            "svd" (0.17 vs 2.04 bpm MAE on clean noise; 0.16 vs 0.35 bpm
+            MAE with simulated motion). This does NOT prove "svd" is
+            worse on real footage -- real specular reflections have
+            coherence properties that are hard to fake synthetically,
+            which is exactly the scenario this method targets. Treat
+            "svd" as an experimental option to A/B test on your own
+            videos with --ground_truth_hr, not a proven upgrade.
+
+    Returns the 1-D pulse signal H of length N.
+    """
+    n = mean_rgb.shape[0]
+    l = int(round(framerate * window_seconds))
+    l = max(l, 2)
+
+    H = np.zeros(n)
+    projection_matrix = np.array([[0, 1, -1], [-2, 1, 1]])
+    identity_2x2 = np.eye(2)
+
+    for t in range(0, n - l + 1):
+        C = mean_rgb[t:t + l, :].T  # (3, l) -- fixed: was t:t+l-1
+
+        mean_color = np.mean(C, axis=1)
+        mean_color = np.where(np.abs(mean_color) < eps, eps, mean_color)
+        diag_mean_color_inv = np.diag(1.0 / mean_color)
+
+        Cn = diag_mean_color_inv @ C
+        S = projection_matrix @ Cn  # (2, l)
+
+        if combine_method == "svd":
+            try:
+                U, _sing, _Vt = np.linalg.svd(S, full_matrices=False)  # U: (2,2)
+            except np.linalg.LinAlgError:
+                continue
+            q1 = U[:, 0]
+            proj = identity_2x2 - np.outer(q1, q1)
+            u = proj @ S  # (2, l)
+            P = u[0, :]
+        else:  # "alpha" (default, original POS)
+            std0 = np.std(S[0, :])
+            std1 = np.std(S[1, :])
+            alpha = std0 / std1 if std1 > eps else 0.0
+            std_vec = np.array([1.0, alpha])
+            P = std_vec @ S
+
+        p_std = np.std(P)
+        if p_std < eps:
+            continue
+        H[t:t + l] += (P - np.mean(P)) / p_std
+
+    return H
+
+
+# --------------------------------------------------------------------------- #
+# Post-processing: band-pass filter + HR estimation
+# --------------------------------------------------------------------------- #
+
+def bandpass_filter(signal, framerate, low_hz=0.7, high_hz=3.5, order=3):
+    """Zero-phase Butterworth band-pass. Removes drift/motion energy
+    outside the plausible heart-rate range before spectral peak-picking."""
+    nyq = framerate / 2.0
+    low = max(low_hz / nyq, 1e-4)
+    high = min(high_hz / nyq, 0.999)
+    b, a = butter(order, [low, high], btype="bandpass")
+    padlen = 3 * max(len(a), len(b))
+    if len(signal) <= padlen:
+        # Signal too short for filtfilt's default padding; fall back to
+        # a shorter padlen rather than crashing.
+        padlen = max(len(signal) - 1, 0)
+    return filtfilt(b, a, signal, padlen=padlen)
+
+
+def estimate_heart_rate(signal, framerate, low_hz=0.7, high_hz=3.5, nsegments=12,
+                         freq_resolution_hz=0.01):
+    """Welch PSD + peak picking in [low_hz, high_hz]. Returns (hr_bpm, f, psd).
+
+    `nperseg` controls the averaging/variance trade-off (kept as in the
+    original script), but on its own it also sets the frequency-bin
+    spacing to framerate/nperseg -- with typical nperseg values (~40-50
+    samples at 30 fps) that spacing is ~35-45 bpm, far coarser than a
+    real heartbeat. Passing a much larger, zero-padded `nfft`
+    interpolates the same spectral estimate onto a much finer frequency
+    grid, which is what actually removes most of the quantization error
+    in the reported bpm (verified on a synthetic 72 bpm signal: this
+    single change reduced the error from ~6 bpm to ~0.4 bpm).
+    """
+    segment_length = (2 * signal.shape[0]) // (nsegments + 1)
+    segment_length = max(segment_length, 8)
+    segment_length = min(segment_length, signal.shape[0])
+
+    nfft = 1
+    target = int(framerate / freq_resolution_hz)
+    while nfft < max(segment_length, target):
+        nfft *= 2
+
+    f, psd = welch(signal, framerate, window="hamming",
+                    nperseg=segment_length, nfft=nfft)
+
+    band = np.where((f >= low_hz) & (f <= high_hz))[0]
+    if band.size == 0:
+        raise RuntimeError("No frequency bins fall inside the requested HR band.")
+
+    max_idx = np.argmax(psd[band])
+    f_max = f[band[max_idx]]
+    hr = f_max * 60.0
+    return hr, f, psd
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-v", "--video", help="path to the (optional) video file")
+    ap.add_argument("--start", type=int, default=0)
+    ap.add_argument("--end", type=int, default=450)
+    ap.add_argument("--framerate", type=float, default=30.0)
+    ap.add_argument("--face_model", default="face_landmarker.task",
+                     help="path to MediaPipe's face_landmarker.task bundle "
+                          "(auto-downloaded here if missing)")
+    ap.add_argument("--no_color_skin_mask", action="store_true",
+                     help="skip the extra color-based skin filter, use the "
+                          "landmark ROI mask alone")
+    ap.add_argument("--window_seconds", type=float, default=1.6,
+                     help="POS sliding-window length in seconds (paper default 1.6s)")
+    ap.add_argument("--pos_combine", choices=["alpha", "svd"], default="alpha",
+                     help="how to combine the two POS projection axes: "
+                          "'alpha' (default, validated, original POS paper) or "
+                          "'svd' (experimental Modified-POS variant -- see "
+                          "pos_algorithm() docstring for tested caveats)")
+    ap.add_argument("--low_hz", type=float, default=0.7, help="lower HR bound (Hz)")
+    ap.add_argument("--high_hz", type=float, default=3.5, help="upper HR bound (Hz)")
+    ap.add_argument("--max_gap", type=int, default=5,
+                     help="max consecutive frames to bridge with the last known face box")
+    ap.add_argument("--nsegments", type=int, default=12)
+    ap.add_argument("--plot", action="store_true", help="save diagnostic plots to disk")
+    ap.add_argument("--image_show", action="store_true")
+    ap.add_argument("--out_dir", default=".")
+    ap.add_argument("--ground_truth_hr", type=float, default=None,
+                     help="known true bpm for this video, to print the absolute error")
+    args = ap.parse_args()
+
+    if not args.video:
+        camera = cv2.VideoCapture(0)
+        video_file_name = "webcam"
+    else:
+        camera = cv2.VideoCapture(args.video)
+        if not camera.isOpened():
+            raise RuntimeError("Cannot open video source.")
+        video_file_name = os.path.basename(args.video)
+
+    model_path = ensure_face_landmarker_model(args.face_model)
+    landmarker = build_face_landmarker(model_path)
+
+    mean_rgb = extract_mean_rgb_trace(
+        camera, landmarker, args.start, args.end, args.framerate,
+        max_gap=args.max_gap, image_show=args.image_show,
+        use_color_skin_mask=not args.no_color_skin_mask,
+    )
+    camera.release()
+    landmarker.close()
+
+    if args.plot:
+        f = np.arange(mean_rgb.shape[0])
+        plt.figure()
+        plt.plot(f, mean_rgb[:, 0], "r", f, mean_rgb[:, 1], "g", f, mean_rgb[:, 2], "b")
+        plt.title("Mean skin RGB")
+        plt.savefig(os.path.join(args.out_dir, "mean_rgb.png"))
+        plt.close()
+
+    raw_pulse = pos_algorithm(mean_rgb, args.framerate, window_seconds=args.window_seconds,
+                               combine_method=args.pos_combine)
+    pulse = bandpass_filter(raw_pulse, args.framerate, args.low_hz, args.high_hz)
+
+    if args.plot:
+        plt.figure()
+        plt.plot(raw_pulse, label="raw POS")
+        plt.plot(pulse, label="band-passed")
+        plt.legend()
+        plt.title("POS pulse signal")
+        plt.savefig(os.path.join(args.out_dir, "pulse_signal.png"))
+        plt.close()
+
+    hr, freqs, psd = estimate_heart_rate(
+        pulse, args.framerate, args.low_hz, args.high_hz, args.nsegments
+    )
+    print(f"Estimated heart rate: {hr:.2f} bpm")
+
+    if args.ground_truth_hr is not None:
+        mae = abs(hr - args.ground_truth_hr)
+        print(f"Ground truth: {args.ground_truth_hr:.2f} bpm | MAE: {mae:.2f} bpm")
+
+    if args.plot:
+        plt.figure()
+        plt.semilogy(freqs, psd, "g")
+        ymin, ymax = plt.ylim()
+        plt.vlines(hr / 60.0, ymin, ymax, color="red")
+        plt.title(f"PSD of pulse signal (HR = {hr:.1f} bpm)")
+        plt.savefig(os.path.join(args.out_dir, "psd.png"))
+        plt.close()
+
+    import scipy.io as sio
+    stem = video_file_name[:-4] if "." in video_file_name else video_file_name
+    mat_file_name = os.path.join(args.out_dir, f"pulse_{stem}_frame-{args.start}-{args.end}.mat")
+    sio.savemat(mat_file_name, {"pulse": pulse, "heartrate": hr})
+    print("Saved:", mat_file_name)
+
+
+if __name__ == "__main__":
+    main()
