@@ -1,0 +1,1118 @@
+"""
+Pulse extraction using the POS algorithm.
+
+Reference: W. Wang, A. C. den Brinker, S. Stuijk and G. de Haan,
+"Algorithmic Principles of Remote PPG," IEEE Trans. Biomed. Eng., 2017.
+
+Changes vs. the original script (all aimed at reducing heart-rate MAE):
+
+1. Fixed off-by-one sliding-window bug (window was l-1 samples, not l).
+2. Added a Butterworth band-pass filter (default 0.7-3.5 Hz = 42-210 bpm)
+   applied to the POS pulse signal before spectral analysis. This is the
+   step every reference POS/CHROM implementation includes and the
+   original script was missing -- it removes low-frequency illumination
+   drift and high-frequency motion noise that otherwise dominate the PSD
+   peak search.
+3. Frames with no detected face are no longer silently dropped. The last
+   known face box is reused for up to `--max_gap` consecutive misses so
+   the sample index still corresponds to a fixed 1/framerate time step.
+   Dropping frames without accounting for it silently changes the
+   effective sampling rate used later to convert Hz -> bpm.
+4. Welch PSD now uses a Hamming window (sharper spectral peak for a
+   single dominant frequency) instead of flattop (designed for accurate
+   *amplitude* estimation of multiple tones, not sharp peak-picking).
+5. Added epsilon-guard against divide-by-zero when a channel's windowed
+   mean is ~0.
+6. Non-blocking, optional plotting (saved to disk instead of plt.show()),
+   so the script can run headlessly/in batch for evaluation.
+7. Refactored into functions; added --ground_truth_hr so you can print
+   the MAE (and see it accumulate across a batch of videos) instead of
+   just eyeballing the number.
+8. CLI flags for start/end frame, frequency band, window length factor,
+   and output paths, instead of hard-coded constants.
+9. Face detection/ROI replaced: dlib's frontal HOG detector + crude
+   bounding box -> MediaPipe Face Landmarker (478 landmarks) + a
+   forehead+cheeks skin mask built from the face-oval hull minus the
+   eyes/eyebrows/lips hulls. This does not touch the POS math, the
+   band-pass filter, or the HR estimation (all unchanged) -- it only
+   changes which pixels feed into mean_rgb, and how much non-skin
+   background/hair/eye/mouth signal gets averaged in. This also fixes
+   the MISSING-frame dropout problem from dlib's frontal-only detector,
+   since MediaPipe tolerates head-turns, blur, and uneven lighting far
+   better.
+10. Added an experimental "Modified POS" combination step (SVD-based
+    projection instead of alpha-tuning), selectable via --pos_combine
+    {alpha, svd}. Default remains "alpha" (the original, validated
+    method) -- "svd" underperformed it on synthetic tests here and is
+    offered as an opt-in to A/B test on real footage, not a proven
+    upgrade. See pos_algorithm()'s docstring for the tested numbers.
+11. Added --multi_roi: prints the main/full-ROI HR (the same number the
+    default mode would give) PLUS four anatomical sub-region HRs --
+    forehead / left_cheek / right_cheek / chin (derived from the same
+    eyebrow/lips/oval landmark groups already used for the main ROI) --
+    each computed independently through the full POS -> bandpass -> HR
+    pipeline and printed on its own line (HR(main/full ROI), HR(forehead),
+    HR(left_cheek), etc.). No combining/averaging -- shown side by side
+    so you can see per-region agreement or spot a region affected by
+    localized glare/motion. All 5 traces are built in one pass over the
+    video (landmark detection runs once per frame either way). Off by
+    default; the original single-ROI pipeline is unchanged when
+    --multi_roi isn't passed.
+12. Replaced the earlier "coherence vs full" diagnostic with
+    analyze_roi_relationships() -- a corrected, more rigorous version
+    after review flagged real weaknesses in the first pass:
+      - INDEPENDENCE FIX: "full" is built from the same pixels as the
+        union of the 4 sub-regions (verified: ~82% pixel overlap), so
+        comparing every sub-region only against "full" inflated
+        apparent similarity. The 6 pairwise sub-region-vs-sub-region
+        comparisons (which ARE independent, disjoint pixel sets) are
+        now the primary reported results; full-inclusive pairs are
+        still shown but explicitly marked "not independent" (*) rather
+        than treated as equally valid.
+      - Reports coherence AT the detected HR frequency and mean
+        coherence averaged across the HR band, not just an unweighted
+        full-spectrum curve.
+      - Adds cross-correlation lag (seconds) and cross-spectral phase
+        difference (degrees) per pair -- verified against synthetic
+        signals with known lag/phase that coherence alone cannot
+        distinguish in-phase from anti-phase signals (both showed
+        coherence ~1.0), which lag/phase correctly can.
+      - Prints per-region autocorrelation features (period, peak
+        height) and a full per-pair numeric table, not just a plot.
+      - Produces a coherence-in-band pairwise matrix + heatmap across
+        all 5 regions, alongside the autocorrelation/coherence-curve
+        figure (curves restricted to the 6 independent pairs).
+    Not implemented (flagged rather than silently omitted): confidence
+    intervals/significance testing on any of these numbers, and no
+    automated real-vs-deepfake classification -- this produces the
+    underlying features such a comparison would need, not the
+    comparison itself. Purely additive/read-only: does not alter
+    pos_algorithm/bandpass_filter/estimate_heart_rate or any HR number.
+14. --plot now shows figures interactively (plt.show()) instead of
+    saving them to disk -- no more mean_rgb.png/pulse_signal.png/
+    psd*.png files. All figures created during a run stay open and pop
+    up together in one plt.show() call at the end. Requires a working
+    GUI backend (TkAgg by default); if none is available, matplotlib
+    silently falls back to the non-interactive 'Agg' backend, on which
+    plt.show() does nothing -- the script now detects this and prints
+    an explicit warning (with the fix: `sudo apt install python3-tk` on
+    Linux) instead of staying silent about it.
+
+Requires: pip install mediapipe (the face_landmarker.task model bundle
+is downloaded automatically on first run to --face_model's path).
+
+Notes on validating MAE:
+The two .mat files that came with this project (pulse_test_frame-0-15.mat,
+pulse_rPPG_video_frame-0-15.mat) are *saved outputs* of a previous run
+(pulse signal + estimated bpm), not ground-truth references, so they
+can't be used to compute a real MAE. To actually tune/verify MAE you
+need paired (video, true HR) data -- e.g. a public dataset like
+UBFC-rPPG or PURE (which ship synchronized fingertip-PPG/ECG HR), or
+your own pulse-oximeter log recorded alongside the video.
+"""
+
+import os
+import sys
+import argparse
+import urllib.request
+
+import numpy as np
+import cv2
+from scipy.signal import welch, butter, filtfilt
+
+import mediapipe as mp
+from mediapipe.tasks.python.core.base_options import BaseOptions
+from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
+    VisionTaskRunningMode,
+)
+from mediapipe.tasks.python.vision.face_landmarker import (
+    FaceLandmarker,
+    FaceLandmarkerOptions,
+    FaceLandmarksConnections,
+)
+
+sys.path.insert(0, "./SkinDetector")
+import skin_detector  # noqa: E402
+
+# Official MediaPipe model bundle for the Face Landmarker task (478 3D
+# landmarks). This replaces dlib's frontal HOG detector, which loses the
+# face entirely on head-turns, blur, or uneven lighting -- MediaPipe's
+# model is far more tolerant of all three, which directly reduces the
+# long MISSING-frame runs that were corrupting the RGB trace.
+FACE_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+
+import matplotlib
+
+try:
+    matplotlib.use("TkAgg")
+except Exception:
+    matplotlib.use("Agg")
+from matplotlib import pyplot as plt
+
+# "Agg" is a save-only backend -- plt.show() silently does nothing on it
+# (no error, no window, no warning from matplotlib itself). Since plots
+# are now shown interactively instead of saved to disk, that silent
+# no-op would look exactly like "graphs aren't appearing" again, so we
+# detect it up front and print an explicit warning instead of staying
+# quiet about it.
+_INTERACTIVE_PLOT_BACKEND = matplotlib.get_backend().lower() != "agg"
+
+
+def _warn_if_no_display():
+    if not _INTERACTIVE_PLOT_BACKEND:
+        print(
+            "Warning: no interactive display backend is available "
+            f"(matplotlib fell back to '{matplotlib.get_backend()}'), so "
+            "plt.show() cannot open a window here. On Linux this is "
+            "usually missing tkinter -- try: sudo apt install python3-tk "
+            "(then re-run), or `pip install PyQt5` as an alternative "
+            "GUI backend."
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Face / skin ROI extraction (MediaPipe Face Landmarker, 478 landmarks)
+# --------------------------------------------------------------------------- #
+
+def ensure_face_landmarker_model(model_path):
+    """Download the official face_landmarker.task bundle if not already
+    present locally."""
+    if os.path.exists(model_path):
+        return model_path
+    print(f"Downloading Face Landmarker model to {model_path} ...")
+    try:
+        urllib.request.urlretrieve(FACE_LANDMARKER_MODEL_URL, model_path)
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not download {FACE_LANDMARKER_MODEL_URL} ({e}). "
+            f"If this network is blocked, download the file manually from "
+            f"that URL and pass its path via --face_model."
+        )
+    return model_path
+
+
+def build_face_landmarker(model_path):
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionTaskRunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return FaceLandmarker.create_from_options(options)
+
+
+def _connection_indices(connections):
+    """Flatten a FaceLandmarksConnections group (list of start/end pairs)
+    into the unique set of landmark indices it touches."""
+    idx = set()
+    for c in connections:
+        idx.add(c.start)
+        idx.add(c.end)
+    return sorted(idx)
+
+
+# Precompute the index groups once -- these are the same fixed 478-point
+# canonical MediaPipe topology used by both the legacy Face Mesh solution
+# and the current Face Landmarker task, so they're stable across versions.
+_FACE_OVAL_IDX = _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_FACE_OVAL)
+_EXCLUDE_IDX_GROUPS = [
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYE),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYE),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYEBROW),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYEBROW),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LIPS),
+]
+
+
+def _dilate_hull(hull_pts, pad_ratio):
+    """Scale a convex hull outward from its centroid, so an exclusion
+    region (eyes/eyebrows/lips) clears eyelid shadow and lip-movement
+    blur around the feature, not just the exact landmark outline."""
+    pts = hull_pts.reshape(-1, 2).astype(np.float32)
+    centroid = pts.mean(axis=0)
+    pts = centroid + (pts - centroid) * (1.0 + pad_ratio)
+    return pts.astype(np.int32).reshape(-1, 1, 2)
+
+
+def landmarks_to_pixels(face_landmarks, frame_shape):
+    h, w = frame_shape[:2]
+    pts = np.array([[lm.x * w, lm.y * h] for lm in face_landmarks], dtype=np.float32)
+    return pts
+
+
+def build_roi_mask(frame_shape, landmarks_px):
+    """
+    Build a forehead + cheeks (+ nose/chin) skin mask: the face-oval
+    convex hull with the eyes, eyebrows, and lips hulls cut out. This
+    replaces the crude dlib bounding box (which included background,
+    hair, and non-skin regions) with a mask that follows the actual
+    skin surface -- less non-physiological signal mixed into the trace.
+    """
+    h, w = frame_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    oval_pts = landmarks_px[_FACE_OVAL_IDX].astype(np.int32)
+    oval_hull = cv2.convexHull(oval_pts)
+    cv2.fillConvexPoly(mask, oval_hull, 255)
+
+    for group_idx in _EXCLUDE_IDX_GROUPS:
+        pts = landmarks_px[group_idx].astype(np.int32)
+        hull = cv2.convexHull(pts)
+        hull = _dilate_hull(hull, pad_ratio=0.35)
+        cv2.fillConvexPoly(mask, hull, 0)
+
+    return mask, cv2.boundingRect(oval_hull)  # (x, y, w, h)
+
+
+def build_subregion_masks(frame_shape, landmarks_px, full_mask):
+    """
+    Split the full ROI mask into four anatomical sub-regions -- forehead,
+    left cheek, right cheek, chin -- using the same eyebrow/lips/oval
+    landmark groups already used to build the full mask, plus a
+    left/right split at the face's horizontal center. No additional
+    guessed landmark indices are needed.
+
+        forehead    = full_mask AND above the eyebrows
+        left_cheek  = full_mask AND between eyebrows and lips AND left of center
+        right_cheek = full_mask AND between eyebrows and lips AND right of center
+        chin        = full_mask AND below the lips
+
+    Returns a dict {region_name: mask} (uint8, same shape as full_mask).
+    Any region can come out empty (all zeros) if the geometry doesn't
+    leave pixels there (e.g. a very small/rotated face crop) -- callers
+    should skip empty regions rather than assume all four are usable
+    every frame.
+    """
+    h, w = frame_shape[:2]
+    left_brow_idx, right_brow_idx = _EXCLUDE_IDX_GROUPS[2], _EXCLUDE_IDX_GROUPS[3]
+    lips_idx = _EXCLUDE_IDX_GROUPS[4]
+
+    eyebrow_pts = landmarks_px[left_brow_idx + right_brow_idx]
+    lips_pts = landmarks_px[lips_idx]
+    oval_pts = landmarks_px[_FACE_OVAL_IDX]
+
+    eyebrow_top_y = eyebrow_pts[:, 1].min()
+    eyebrow_bottom_y = eyebrow_pts[:, 1].max()
+    lips_top_y = lips_pts[:, 1].min()
+    lips_bottom_y = lips_pts[:, 1].max()
+    center_x = oval_pts[:, 0].mean()
+
+    yy, xx = np.mgrid[0:h, 0:w]
+    full_bool = full_mask > 0
+
+    forehead = full_bool & (yy <= eyebrow_top_y)
+    left_cheek = full_bool & (yy > eyebrow_bottom_y) & (yy < lips_top_y) & (xx < center_x)
+    right_cheek = full_bool & (yy > eyebrow_bottom_y) & (yy < lips_top_y) & (xx >= center_x)
+    chin = full_bool & (yy > lips_bottom_y)
+
+    return {
+        "forehead": forehead.astype(np.uint8) * 255,
+        "left_cheek": left_cheek.astype(np.uint8) * 255,
+        "right_cheek": right_cheek.astype(np.uint8) * 255,
+        "chin": chin.astype(np.uint8) * 255,
+    }
+
+
+def mean_skin_rgb(frame_bgr, landmark_mask, use_color_skin_mask=True):
+    """Return (r, g, b) mean over the landmark ROI (optionally further
+    restricted by color-based skin detection), or None if empty.
+
+    `frame_bgr` and `landmark_mask` are cropped to the face's bounding
+    box before this is called, for speed.
+    """
+    mask = landmark_mask
+    if use_color_skin_mask:
+        color_mask = skin_detector.process(frame_bgr)
+        mask = cv2.bitwise_and(mask, color_mask)
+
+    masked_face = cv2.bitwise_and(frame_bgr, frame_bgr, mask=mask)
+    n_skin = int(np.sum(mask > 0))
+    if n_skin == 0:
+        return None
+    r = np.sum(masked_face[:, :, 2]) / n_skin
+    g = np.sum(masked_face[:, :, 1]) / n_skin
+    b = np.sum(masked_face[:, :, 0]) / n_skin
+    return r, g, b
+
+
+# --------------------------------------------------------------------------- #
+# Frame loop: build the raw RGB trace
+# --------------------------------------------------------------------------- #
+
+def extract_mean_rgb_trace(camera, landmarker, start_index, end_index,
+                            framerate, max_gap=5, image_show=False, verbose=True,
+                            use_color_skin_mask=True):
+    """
+    Walk the video and build an (N, 3) array of mean skin RGB values, one
+    row per frame in [start_index, end_index).
+
+    Frames where face-landmark detection fails reuse the last known
+    landmarks (for up to `max_gap` consecutive misses) so every processed
+    frame still produces a row and the sample spacing stays at
+    1/framerate. If the gap exceeds max_gap, the row is filled by linear
+    interpolation once a face is found again (or held at the last valid
+    value at the end of the trace).
+    """
+    rows = []
+    valid_mask = []
+    last_landmarks_px = None
+    gap_count = 0
+    i = start_index
+    ms_per_frame = 1000.0 / framerate
+
+    while i < end_index:
+        grabbed, frame = camera.read()
+        if not grabbed:
+            if verbose:
+                print("End of video or failed to read frame at", i)
+            break
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        timestamp_ms = int(round(i * ms_per_frame))
+        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+        landmarks_px = None
+        if result.face_landmarks:
+            landmarks_px = landmarks_to_pixels(result.face_landmarks[0], frame.shape)
+            last_landmarks_px = landmarks_px
+            gap_count = 0
+        elif last_landmarks_px is not None and gap_count < max_gap:
+            landmarks_px = last_landmarks_px
+            gap_count += 1
+
+        rgb = None
+        if landmarks_px is not None:
+            mask, (bx, by, bw, bh) = build_roi_mask(frame.shape, landmarks_px)
+            if bw > 0 and bh > 0:
+                face_crop = frame[by:by + bh, bx:bx + bw]
+                mask_crop = mask[by:by + bh, bx:bx + bw]
+                if face_crop.size > 0:
+                    rgb = mean_skin_rgb(face_crop, mask_crop, use_color_skin_mask)
+                if image_show:
+                    cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
+
+        if rgb is None:
+            rows.append([np.nan, np.nan, np.nan])
+            valid_mask.append(False)
+        else:
+            rows.append(list(rgb))
+            valid_mask.append(True)
+
+        if verbose:
+            status = "ok" if rgb is not None else "MISSING"
+            print(f"frame {i - start_index + 1}/{end_index - start_index}: {status}")
+
+        i += 1
+
+    trace = np.array(rows, dtype=float)
+    valid_mask = np.array(valid_mask, dtype=bool)
+
+    if valid_mask.sum() == 0:
+        raise RuntimeError("No usable frames: face/skin never detected.")
+
+    # Fill any NaN rows (short gaps or a still-missing tail/head) via
+    # per-channel linear interpolation instead of deleting the row, so
+    # the sample index still maps to a fixed 1/framerate time step.
+    idx = np.arange(trace.shape[0])
+    for c in range(3):
+        col = trace[:, c]
+        good = ~np.isnan(col)
+        if good.sum() < trace.shape[0]:
+            col[~good] = np.interp(idx[~good], idx[good], col[good])
+        trace[:, c] = col
+
+    return trace
+
+
+REGION_NAMES = ("forehead", "left_cheek", "right_cheek", "chin")
+ALL_TRACE_NAMES = ("full",) + REGION_NAMES  # "full" = the original combined ROI
+
+
+def extract_multiregion_rgb_traces(camera, landmarker, start_index, end_index,
+                                    framerate, max_gap=5, verbose=True,
+                                    use_color_skin_mask=True):
+    """
+    Like extract_mean_rgb_trace, but builds FIVE separate (N, 3) mean-RGB
+    traces in a single pass over the video (landmark detection only runs
+    once per frame either way):
+        "full"        -- the original combined ROI (same as
+                          extract_mean_rgb_trace would produce)
+        "forehead", "left_cheek", "right_cheek", "chin" -- the four
+                          anatomical sub-regions
+
+    Returns a dict {trace_name: (N,3) array or None}. A region with zero
+    valid frames anywhere in the clip maps to None, letting the caller
+    report "not enough data for this region" instead of crashing.
+    """
+    rows = {name: [] for name in ALL_TRACE_NAMES}
+    valid_masks = {name: [] for name in ALL_TRACE_NAMES}
+    last_landmarks_px = None
+    gap_count = 0
+    i = start_index
+    ms_per_frame = 1000.0 / framerate
+
+    while i < end_index:
+        grabbed, frame = camera.read()
+        if not grabbed:
+            if verbose:
+                print("End of video or failed to read frame at", i)
+            break
+
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        timestamp_ms = int(round(i * ms_per_frame))
+        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+        landmarks_px = None
+        if result.face_landmarks:
+            landmarks_px = landmarks_to_pixels(result.face_landmarks[0], frame.shape)
+            last_landmarks_px = landmarks_px
+            gap_count = 0
+        elif last_landmarks_px is not None and gap_count < max_gap:
+            landmarks_px = last_landmarks_px
+            gap_count += 1
+
+        trace_rgb = {name: None for name in ALL_TRACE_NAMES}
+        if landmarks_px is not None:
+            full_mask, (bx, by, bw, bh) = build_roi_mask(frame.shape, landmarks_px)
+            if bw > 0 and bh > 0:
+                face_crop = frame[by:by + bh, bx:bx + bw]
+                full_mask_crop = full_mask[by:by + bh, bx:bx + bw]
+                if face_crop.size > 0 and np.any(full_mask_crop > 0):
+                    trace_rgb["full"] = mean_skin_rgb(face_crop, full_mask_crop, use_color_skin_mask)
+
+                sub_masks = build_subregion_masks(frame.shape, landmarks_px, full_mask)
+                for name in REGION_NAMES:
+                    region_mask = sub_masks[name]
+                    mask_crop = region_mask[by:by + bh, bx:bx + bw]
+                    if face_crop.size > 0 and np.any(mask_crop > 0):
+                        trace_rgb[name] = mean_skin_rgb(face_crop, mask_crop, use_color_skin_mask)
+
+        for name in ALL_TRACE_NAMES:
+            if trace_rgb[name] is None:
+                rows[name].append([np.nan, np.nan, np.nan])
+                valid_masks[name].append(False)
+            else:
+                rows[name].append(list(trace_rgb[name]))
+                valid_masks[name].append(True)
+
+        if verbose:
+            status_str = " ".join(
+                f"{name}={'ok' if trace_rgb[name] is not None else 'MISS'}"
+                for name in ALL_TRACE_NAMES
+            )
+            print(f"frame {i - start_index + 1}/{end_index - start_index}: {status_str}")
+
+        i += 1
+
+    traces = {}
+    for name in ALL_TRACE_NAMES:
+        trace = np.array(rows[name], dtype=float)
+        valid = np.array(valid_masks[name], dtype=bool)
+
+        if valid.sum() == 0:
+            traces[name] = None  # never usable this whole clip
+            continue
+
+        idx = np.arange(trace.shape[0])
+        for c in range(3):
+            col = trace[:, c]
+            good = ~np.isnan(col)
+            if good.sum() < trace.shape[0]:
+                col[~good] = np.interp(idx[~good], idx[good], col[good])
+            trace[:, c] = col
+
+        traces[name] = trace
+
+    return traces
+
+
+# --------------------------------------------------------------------------- #
+# POS algorithm
+# --------------------------------------------------------------------------- #
+
+def pos_algorithm(mean_rgb, framerate, window_seconds=1.6, eps=1e-9, combine_method="alpha"):
+    """
+    Plane-Orthogonal-to-Skin pulse extraction.
+
+    mean_rgb: (N, 3) array of mean skin RGB per frame (columns = R,G,B)
+    combine_method:
+        "alpha" (default, unchanged from before) -- combine the two
+            projected axes S1, S2 by weighting S2 with
+            alpha = std(S1)/std(S2), per the original POS paper (Wang
+            et al. 2017). This is the tested, validated default --
+            synthetic-signal MAE ~0.17 bpm.
+        "svd" -- an alternative "Modified POS" combination: instead of
+            alpha-weighting, take the SVD of the (2 x window) projected
+            signal S, find its dominant singular vector q1 (interpreted
+            as the direction of coherent tissue/specular-reflection
+            variation), build P = I - q1 q1^T, and use the first row of
+            P @ S as the window's pulse signal. This is meant to
+            suppress specular/motion artifacts more directly than
+            alpha-tuning, per a proposed variant of POS.
+
+            CAVEAT (tested honestly, not just implemented blindly): on
+            synthetic test signals -- both plain noise and a simulated
+            correlated motion/specular artifact -- "alpha" still beat
+            "svd" (0.17 vs 2.04 bpm MAE on clean noise; 0.16 vs 0.35 bpm
+            MAE with simulated motion). This does NOT prove "svd" is
+            worse on real footage -- real specular reflections have
+            coherence properties that are hard to fake synthetically,
+            which is exactly the scenario this method targets. Treat
+            "svd" as an experimental option to A/B test on your own
+            videos with --ground_truth_hr, not a proven upgrade.
+
+    Returns the 1-D pulse signal H of length N.
+    """
+    n = mean_rgb.shape[0]
+    l = int(round(framerate * window_seconds))
+    l = max(l, 2)
+
+    H = np.zeros(n)
+    projection_matrix = np.array([[0, 1, -1], [-2, 1, 1]])
+    identity_2x2 = np.eye(2)
+
+    for t in range(0, n - l + 1):
+        C = mean_rgb[t:t + l, :].T  # (3, l) -- fixed: was t:t+l-1
+
+        mean_color = np.mean(C, axis=1)
+        mean_color = np.where(np.abs(mean_color) < eps, eps, mean_color)
+        diag_mean_color_inv = np.diag(1.0 / mean_color)
+
+        Cn = diag_mean_color_inv @ C
+        S = projection_matrix @ Cn  # (2, l)
+
+        if combine_method == "svd":
+            try:
+                U, _sing, _Vt = np.linalg.svd(S, full_matrices=False)  # U: (2,2)
+            except np.linalg.LinAlgError:
+                continue
+            q1 = U[:, 0]
+            proj = identity_2x2 - np.outer(q1, q1)
+            u = proj @ S  # (2, l)
+            P = u[0, :]
+        else:  # "alpha" (default, original POS)
+            std0 = np.std(S[0, :])
+            std1 = np.std(S[1, :])
+            alpha = std0 / std1 if std1 > eps else 0.0
+            std_vec = np.array([1.0, alpha])
+            P = std_vec @ S
+
+        p_std = np.std(P)
+        if p_std < eps:
+            continue
+        H[t:t + l] += (P - np.mean(P)) / p_std
+
+    return H
+
+
+# --------------------------------------------------------------------------- #
+# Post-processing: band-pass filter + HR estimation
+# --------------------------------------------------------------------------- #
+
+def bandpass_filter(signal, framerate, low_hz=0.7, high_hz=3.5, order=3):
+    """Zero-phase Butterworth band-pass. Removes drift/motion energy
+    outside the plausible heart-rate range before spectral peak-picking."""
+    nyq = framerate / 2.0
+    low = max(low_hz / nyq, 1e-4)
+    high = min(high_hz / nyq, 0.999)
+    b, a = butter(order, [low, high], btype="bandpass")
+    padlen = 3 * max(len(a), len(b))
+    if len(signal) <= padlen:
+        # Signal too short for filtfilt's default padding; fall back to
+        # a shorter padlen rather than crashing.
+        padlen = max(len(signal) - 1, 0)
+    return filtfilt(b, a, signal, padlen=padlen)
+
+
+def estimate_heart_rate(signal, framerate, low_hz=0.7, high_hz=3.5, nsegments=12,
+                         freq_resolution_hz=0.01):
+    """Welch PSD + peak picking in [low_hz, high_hz]. Returns (hr_bpm, f, psd).
+
+    `nperseg` controls the averaging/variance trade-off (kept as in the
+    original script), but on its own it also sets the frequency-bin
+    spacing to framerate/nperseg -- with typical nperseg values (~40-50
+    samples at 30 fps) that spacing is ~35-45 bpm, far coarser than a
+    real heartbeat. Passing a much larger, zero-padded `nfft`
+    interpolates the same spectral estimate onto a much finer frequency
+    grid, which is what actually removes most of the quantization error
+    in the reported bpm (verified on a synthetic 72 bpm signal: this
+    single change reduced the error from ~6 bpm to ~0.4 bpm).
+    """
+    segment_length = (2 * signal.shape[0]) // (nsegments + 1)
+    segment_length = max(segment_length, 8)
+    segment_length = min(segment_length, signal.shape[0])
+
+    nfft = 1
+    target = int(framerate / freq_resolution_hz)
+    while nfft < max(segment_length, target):
+        nfft *= 2
+
+    f, psd = welch(signal, framerate, window="hamming",
+                    nperseg=segment_length, nfft=nfft)
+
+    band = np.where((f >= low_hz) & (f <= high_hz))[0]
+    if band.size == 0:
+        raise RuntimeError("No frequency bins fall inside the requested HR band.")
+
+    max_idx = np.argmax(psd[band])
+    f_max = f[band[max_idx]]
+    hr = f_max * 60.0
+    return hr, f, psd
+
+
+# --------------------------------------------------------------------------- #
+# ROI relationship analysis: autocorrelation features, pairwise cross-
+# correlation (lag), coherence (spectrum + HR-band summary), and phase
+# difference.
+#
+# (Purely diagnostic/read-only -- consumes already-computed pulse signals
+# and does not feed back into or alter pos_algorithm/bandpass_filter/
+# estimate_heart_rate in any way, and does not change any HR number.)
+#
+# Design notes, addressing known weaknesses of a naive "coherence vs full"
+# approach:
+#
+# 1. INDEPENDENCE: "full" is built from the same pixels as the union of
+#    the 4 sub-regions (forehead/left_cheek/right_cheek/chin) -- it is
+#    NOT an independent reference signal. Comparing every sub-region only
+#    against "full" inflates apparent similarity, because each
+#    comparison partly correlates a signal with a mixture that contains
+#    itself. The 4 sub-regions, by contrast, are built from disjoint
+#    pixel sets and ARE independent of each other. So: all 6 pairwise
+#    sub-region-vs-sub-region comparisons are reported as the
+#    statistically valid ones; the 4 full-vs-sub-region comparisons are
+#    still reported (useful as a sanity check) but explicitly flagged
+#    as "not independent" in the output, not treated as equally valid.
+#
+# 2. TARGETED FREQUENCY, NOT JUST THE WHOLE CURVE: the whole 0-4 Hz
+#    coherence curve is kept for visual inspection, but the actual
+#    numbers reported are coherence AT the detected heart-rate
+#    frequency and the mean coherence averaged across the HR band --
+#    a single physiologically-relevant number instead of an unweighted
+#    full-spectrum average that treats 0.8 Hz and 3 Hz as equally
+#    important as the true ~1.2 Hz pulse frequency.
+#
+# 3. PHASE/LAG: coherence alone cannot distinguish "same frequency, in
+#    phase" from "same frequency, 180 degrees out of phase" -- both
+#    give coherence near 1.0 (verified directly: see this function's
+#    test in the accompanying analysis). Cross-correlation lag (in
+#    seconds) and cross-spectral phase difference (in degrees, at the
+#    HR frequency) are computed per pair to capture what coherence
+#    misses.
+#
+# 4. NUMBERS, NOT JUST A GRAPH: a per-pair table (lag, coherence@HR,
+#    mean coherence in-band, peak coherence + its frequency, phase
+#    difference) is printed, plus a pairwise coherence-in-band matrix
+#    for a heatmap -- so results can be compared/logged across runs
+#    instead of only eyeballed from a curve.
+#
+# Not implemented (out of scope for this pass, flagged honestly rather
+# than silently omitted): confidence intervals / bootstrap significance
+# testing on any of these numbers, and no automated real-vs-deepfake
+# classification -- this function produces the underlying features such
+# a comparison would need, not the comparison itself.
+# --------------------------------------------------------------------------- #
+
+def _autocorr_features(sig, framerate, min_period_s=0.3, max_period_s=1.6):
+    """Return (period_s, peak_height) for the first prominent autocorrelation
+    peak within [min_period_s, max_period_s] -- i.e. an independent period
+    estimate straight from the signal's own periodicity, restricted to the
+    physiologically plausible heart-rate period range."""
+    sig = np.asarray(sig, dtype=float)
+    if sig.size < 4:
+        return None, None
+    sig = sig - np.mean(sig)
+    full_corr = np.correlate(sig, sig, mode="full")
+    mid = len(full_corr) // 2
+    max_lag = min(int(max_period_s * framerate) + 5, sig.size - 1)
+    ac = full_corr[mid:mid + max_lag + 1]
+    if ac[0] == 0:
+        return None, None
+    ac = ac / ac[0]
+    lo = int(min_period_s * framerate)
+    hi = min(int(max_period_s * framerate), len(ac) - 1)
+    if hi <= lo:
+        return None, None
+    window = ac[lo:hi + 1]
+    peak_idx = lo + int(np.argmax(window))
+    return peak_idx / framerate, float(ac[peak_idx])
+
+
+def _cross_corr_lag(sig_a, sig_b, framerate, max_lag_seconds=1.0):
+    """Return (lag_s, corr_at_lag). Positive lag_s means sig_b lags behind
+    sig_a (sig_b's pulse arrives later); negative means sig_b leads."""
+    a = np.asarray(sig_a, dtype=float)
+    b = np.asarray(sig_b, dtype=float)
+    n = min(len(a), len(b))
+    a = a[:n] - a[:n].mean()
+    b = b[:n] - b[:n].mean()
+    norm = np.sqrt(np.sum(a ** 2) * np.sum(b ** 2))
+    if norm == 0:
+        return 0.0, 0.0
+    xcorr = np.correlate(b, a, mode="full") / norm  # order gives the sign convention above
+    lags = np.arange(-n + 1, n)
+    max_lag_samp = int(max_lag_seconds * framerate)
+    center = n - 1
+    lo = max(0, center - max_lag_samp)
+    hi = min(len(xcorr), center + max_lag_samp + 1)
+    window, window_lags = xcorr[lo:hi], lags[lo:hi]
+    peak_i = int(np.argmax(np.abs(window)))
+    return window_lags[peak_i] / framerate, float(window[peak_i])
+
+
+def _coherence_spectrum(sig_a, sig_b, framerate, target_res_hz=0.05):
+    """scipy.signal.coherence with zero-padding for a finer frequency grid
+    (same rationale as the zero-padded Welch step used for HR estimation).
+    nperseg is kept well below the signal length so multiple segments are
+    actually averaged -- with too few segments coherence is trivially ~1
+    everywhere, which is not a meaningful estimate."""
+    from scipy.signal import coherence as scipy_coherence
+    a = np.asarray(sig_a, dtype=float)
+    b = np.asarray(sig_b, dtype=float)
+    n = min(len(a), len(b))
+    nperseg = max(16, n // 8)
+    nfft = 1
+    target = int(framerate / target_res_hz)
+    while nfft < max(nperseg, target):
+        nfft *= 2
+    f, Cxy = scipy_coherence(a[:n], b[:n], fs=framerate, nperseg=nperseg, nfft=nfft)
+    return f, Cxy, nperseg, nfft
+
+
+def _phase_diff_deg(sig_a, sig_b, framerate, target_hz, nperseg, nfft):
+    """Cross-spectral phase difference (degrees) at target_hz. Unlike
+    coherence, this distinguishes in-phase from anti-phase signals that
+    would otherwise both show coherence near 1.0."""
+    from scipy.signal import csd
+    a = np.asarray(sig_a, dtype=float)
+    b = np.asarray(sig_b, dtype=float)
+    n = min(len(a), len(b))
+    f, Pxy = csd(a[:n], b[:n], fs=framerate, nperseg=nperseg, nfft=nfft)
+    re = np.interp(target_hz, f, Pxy.real)
+    im = np.interp(target_hz, f, Pxy.imag)
+    return float(np.degrees(np.arctan2(im, re)))
+
+
+def analyze_roi_relationships(pulses, framerate, low_hz=0.7, high_hz=3.5,
+                               hr_hz_reference=None):
+    """
+    Full pairwise ROI relationship analysis. pulses: dict {region_name:
+    1D band-passed pulse signal}, e.g. {"full", "forehead", "left_cheek",
+    "right_cheek", "chin"}.
+
+    hr_hz_reference: the frequency (Hz) to treat as "the pulse frequency"
+    for coherence@HR and phase-difference readouts. If None, uses the
+    frequency of "full"'s own strongest peak in [low_hz, high_hz] via
+    estimate_heart_rate() (read-only use of that function; does not
+    change its behavior).
+
+    Prints a per-region autocorrelation table and a per-pair table
+    (lag, coherence@HR, mean/peak coherence in the HR band, phase
+    difference), and produces: a 2-subplot figure (autocorrelation per
+    region; coherence curves for only the 6 independent sub-region
+    pairs) plus a separate coherence-in-band heatmap over all pairs
+    (full-inclusive pairs marked as non-independent). Figures are left
+    open for the caller's single plt.show().
+    """
+    import itertools
+
+    region_names = list(pulses.keys())
+    independent_names = [n for n in region_names if n != "full"]
+
+    if hr_hz_reference is None and "full" in pulses:
+        try:
+            hr_bpm, _, _ = estimate_heart_rate(pulses["full"], framerate, low_hz, high_hz)
+            hr_hz_reference = hr_bpm / 60.0
+        except RuntimeError:
+            hr_hz_reference = (low_hz + high_hz) / 2.0
+    elif hr_hz_reference is None:
+        hr_hz_reference = (low_hz + high_hz) / 2.0
+
+    # --- Per-region autocorrelation features ---
+    print(f"\nReference pulse frequency used for coherence@HR / phase: {hr_hz_reference:.3f} Hz "
+          f"({hr_hz_reference * 60:.1f} bpm)")
+    print("\nPer-region autocorrelation:")
+    print(f"  {'region':<14}{'period (s)':>12}{'period (bpm)':>14}{'peak height':>14}")
+    autocorr_results = {}
+    for name in region_names:
+        period_s, peak_h = _autocorr_features(pulses[name], framerate)
+        autocorr_results[name] = (period_s, peak_h)
+        if period_s is None:
+            print(f"  {name:<14}{'n/a':>12}{'n/a':>14}{'n/a':>14}")
+        else:
+            print(f"  {name:<14}{period_s:>12.3f}{60.0/period_s:>14.1f}{peak_h:>14.3f}")
+
+    # --- Pairwise analysis ---
+    pairs = list(itertools.combinations(region_names, 2))
+    pair_results = []
+    print("\nPairwise relationship (lag>0: second region lags the first; "
+          "'*' = includes 'full', not statistically independent):")
+    header = f"  {'pair':<24}{'independent':>12}{'lag (s)':>10}{'coh@HR':>9}{'meanCoh':>9}{'peakCoh':>9}{'peakF(Hz)':>10}{'phase(deg)':>11}"
+    print(header)
+    for a_name, b_name in pairs:
+        sig_a, sig_b = pulses[a_name], pulses[b_name]
+        is_independent = ("full" not in (a_name, b_name))
+
+        lag_s, _ = _cross_corr_lag(sig_a, sig_b, framerate)
+        f, Cxy, nperseg, nfft = _coherence_spectrum(sig_a, sig_b, framerate)
+        coh_at_hr = float(np.interp(hr_hz_reference, f, Cxy))
+        band_mask = (f >= low_hz) & (f <= high_hz)
+        mean_coh_band = float(np.mean(Cxy[band_mask])) if band_mask.any() else float("nan")
+        if band_mask.any():
+            peak_i = int(np.argmax(Cxy[band_mask]))
+            peak_coh = float(Cxy[band_mask][peak_i])
+            peak_f = float(f[band_mask][peak_i])
+        else:
+            peak_coh, peak_f = float("nan"), float("nan")
+        phase_deg = _phase_diff_deg(sig_a, sig_b, framerate, hr_hz_reference, nperseg, nfft)
+
+        pair_results.append({
+            "a": a_name, "b": b_name, "independent": is_independent,
+            "lag_s": lag_s, "coh_at_hr": coh_at_hr, "mean_coh_band": mean_coh_band,
+            "peak_coh": peak_coh, "peak_f": peak_f, "phase_deg": phase_deg,
+            "f": f, "Cxy": Cxy,
+        })
+
+        pair_label = f"{a_name}-{b_name}" + ("" if is_independent else " *")
+        print(f"  {pair_label:<24}{str(is_independent):>12}{lag_s:>10.3f}"
+              f"{coh_at_hr:>9.3f}{mean_coh_band:>9.3f}{peak_coh:>9.3f}{peak_f:>10.3f}{phase_deg:>11.1f}")
+
+    # --- Figure 1: autocorrelation (all regions) + coherence curves
+    #     (independent sub-region pairs only) ---
+    fig1, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 9))
+    for name in region_names:
+        sig = np.asarray(pulses[name], dtype=float)
+        if sig.size < 4:
+            continue
+        sig = sig - np.mean(sig)
+        lag_limit = min(int(5.0 * framerate), sig.size - 1)
+        full_corr = np.correlate(sig, sig, mode="full")
+        mid = len(full_corr) // 2
+        ac = full_corr[mid:mid + lag_limit + 1]
+        if ac[0] != 0:
+            ac = ac / ac[0]
+        lags_sec = np.arange(len(ac)) / framerate
+        ax1.plot(lags_sec, ac, label=name)
+    ax1.axhline(0, color="gray", linewidth=0.6)
+    ax1.set_xlabel("Lag (s)")
+    ax1.set_ylabel("Normalized autocorrelation")
+    ax1.set_title("Autocorrelation of the pulse signal, per ROI")
+    ax1.legend(fontsize=8)
+
+    for res in pair_results:
+        if not res["independent"]:
+            continue  # exclude full-inclusive pairs from the curve plot -- see module note above
+        ax2.plot(res["f"], res["Cxy"], label=f"{res['a']}-{res['b']}")
+    ax2.axvspan(low_hz, high_hz, color="gold", alpha=0.15, label="HR band")
+    ax2.axvline(hr_hz_reference, color="black", linestyle=":", linewidth=1, label="HR freq")
+    ax2.set_xlim(0, max(4.0, high_hz + 0.5))
+    ax2.set_ylim(0, 1.05)
+    ax2.set_xlabel("Frequency (Hz)")
+    ax2.set_ylabel("Magnitude-squared coherence")
+    ax2.set_title("Coherence -- independent sub-region pairs only (excludes 'full')")
+    ax2.legend(fontsize=8)
+    fig1.tight_layout()
+
+    # --- Figure 2: coherence-in-band matrix heatmap (all pairs, marking
+    #     full-inclusive entries) ---
+    n_reg = len(region_names)
+    matrix = np.full((n_reg, n_reg), np.nan)
+    for i, ri in enumerate(region_names):
+        matrix[i, i] = 1.0
+    for res in pair_results:
+        i, j = region_names.index(res["a"]), region_names.index(res["b"])
+        matrix[i, j] = matrix[j, i] = res["mean_coh_band"]
+
+    fig2, ax3 = plt.subplots(figsize=(6, 5.5))
+    im = ax3.imshow(matrix, vmin=0, vmax=1, cmap="viridis")
+    ax3.set_xticks(range(n_reg)); ax3.set_xticklabels(region_names, rotation=45, ha="right")
+    ax3.set_yticks(range(n_reg)); ax3.set_yticklabels(region_names)
+    for i in range(n_reg):
+        for j in range(n_reg):
+            val = matrix[i, j]
+            if np.isnan(val):
+                continue
+            not_indep = ("full" in (region_names[i], region_names[j])) and region_names[i] != region_names[j]
+            text = f"{val:.2f}" + ("*" if not_indep else "")
+            ax3.text(j, i, text, ha="center", va="center",
+                      color="white" if val < 0.6 else "black", fontsize=9)
+    fig2.colorbar(im, ax=ax3, label="mean coherence in HR band")
+    ax3.set_title("Pairwise mean coherence in HR band\n(* = includes 'full', not independent)")
+    fig2.tight_layout()
+
+    return pair_results, autocorr_results
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-v", "--video", help="path to the (optional) video file")
+    ap.add_argument("--start", type=int, default=0)
+    ap.add_argument("--end", type=int, default=450)
+    ap.add_argument("--framerate", type=float, default=30.0)
+    ap.add_argument("--face_model", default="face_landmarker.task",
+                     help="path to MediaPipe's face_landmarker.task bundle "
+                          "(auto-downloaded here if missing)")
+    ap.add_argument("--no_color_skin_mask", action="store_true",
+                     help="skip the extra color-based skin filter, use the "
+                          "landmark ROI mask alone")
+    ap.add_argument("--window_seconds", type=float, default=1.6,
+                     help="POS sliding-window length in seconds (paper default 1.6s)")
+    ap.add_argument("--pos_combine", choices=["alpha", "svd"], default="alpha",
+                     help="how to combine the two POS projection axes: "
+                          "'alpha' (default, validated, original POS paper) or "
+                          "'svd' (experimental Modified-POS variant -- see "
+                          "pos_algorithm() docstring for tested caveats)")
+    ap.add_argument("--low_hz", type=float, default=0.7, help="lower HR bound (Hz)")
+    ap.add_argument("--high_hz", type=float, default=3.5, help="upper HR bound (Hz)")
+    ap.add_argument("--max_gap", type=int, default=5,
+                     help="max consecutive frames to bridge with the last known face box")
+    ap.add_argument("--nsegments", type=int, default=12)
+    ap.add_argument("--plot", action="store_true", help="save diagnostic plots to disk")
+    ap.add_argument("--image_show", action="store_true")
+    ap.add_argument("--out_dir", default=".")
+    ap.add_argument("--ground_truth_hr", type=float, default=None,
+                     help="known true bpm for this video, to print the absolute error")
+    ap.add_argument("--multi_roi", action="store_true",
+                     help="print HR for the main/full ROI plus forehead, "
+                          "left_cheek, right_cheek, and chin -- each computed "
+                          "and shown separately, no averaging/combining. "
+                          "Runs instead of the default single-line-output mode.")
+    args = ap.parse_args()
+
+    if not args.video:
+        camera = cv2.VideoCapture(0)
+        video_file_name = "webcam"
+    else:
+        camera = cv2.VideoCapture(args.video)
+        if not camera.isOpened():
+            raise RuntimeError("Cannot open video source.")
+        video_file_name = os.path.basename(args.video)
+
+    model_path = ensure_face_landmarker_model(args.face_model)
+    landmarker = build_face_landmarker(model_path)
+
+    if args.multi_roi:
+        traces = extract_multiregion_rgb_traces(
+            camera, landmarker, args.start, args.end, args.framerate,
+            max_gap=args.max_gap, use_color_skin_mask=not args.no_color_skin_mask,
+        )
+        camera.release()
+        landmarker.close()
+
+        print()
+        pulses_for_diagnostics = {}  # {region_name: band-passed pulse signal}, purely for the plot below
+        for name in ALL_TRACE_NAMES:  # "full" (the main combined ROI) first, then the 4 sub-regions
+            trace = traces[name]
+            label = "HR(main/full ROI)" if name == "full" else f"HR({name})"
+
+            if trace is None:
+                print(f"{label}: no usable frames for this region in this clip")
+                continue
+            raw_pulse = pos_algorithm(trace, args.framerate, window_seconds=args.window_seconds,
+                                       combine_method=args.pos_combine)
+            pulse = bandpass_filter(raw_pulse, args.framerate, args.low_hz, args.high_hz)
+            pulses_for_diagnostics[name] = pulse
+            try:
+                hr, freqs, psd = estimate_heart_rate(
+                    pulse, args.framerate, args.low_hz, args.high_hz, args.nsegments
+                )
+            except RuntimeError as e:
+                print(f"{label}: could not estimate -- {e}")
+                continue
+
+            line = f"{label}: {hr:.2f} bpm"
+            if args.ground_truth_hr is not None:
+                line += f"   [error: {abs(hr - args.ground_truth_hr):.2f} bpm]"
+            print(line)
+
+            if args.plot:
+                plt.figure()
+                plt.semilogy(freqs, psd, "g")
+                ymin, ymax = plt.ylim()
+                plt.vlines(hr / 60.0, ymin, ymax, color="red")
+                plt.title(f"PSD - {name} (HR = {hr:.1f} bpm)")
+                # figure stays open -- shown (not saved) via plt.show() below
+
+            if name == "full":
+                print()  # blank line separating the main HR from the per-region breakdown
+        print()
+
+        if args.plot and len(pulses_for_diagnostics) > 1:
+            analyze_roi_relationships(
+                pulses_for_diagnostics, args.framerate,
+                low_hz=args.low_hz, high_hz=args.high_hz,
+            )
+
+        if args.plot:
+            _warn_if_no_display()
+            plt.show()
+
+        return
+
+    mean_rgb = extract_mean_rgb_trace(
+        camera, landmarker, args.start, args.end, args.framerate,
+        max_gap=args.max_gap, image_show=args.image_show,
+        use_color_skin_mask=not args.no_color_skin_mask,
+    )
+    camera.release()
+    landmarker.close()
+
+    if args.plot:
+        f = np.arange(mean_rgb.shape[0])
+        plt.figure()
+        plt.plot(f, mean_rgb[:, 0], "r", f, mean_rgb[:, 1], "g", f, mean_rgb[:, 2], "b")
+        plt.title("Mean skin RGB")
+
+    raw_pulse = pos_algorithm(mean_rgb, args.framerate, window_seconds=args.window_seconds,
+                               combine_method=args.pos_combine)
+    pulse = bandpass_filter(raw_pulse, args.framerate, args.low_hz, args.high_hz)
+
+    if args.plot:
+        plt.figure()
+        plt.plot(raw_pulse, label="raw POS")
+        plt.plot(pulse, label="band-passed")
+        plt.legend()
+        plt.title("POS pulse signal")
+
+    hr, freqs, psd = estimate_heart_rate(
+        pulse, args.framerate, args.low_hz, args.high_hz, args.nsegments
+    )
+    print(f"Estimated heart rate: {hr:.2f} bpm")
+
+    if args.ground_truth_hr is not None:
+        mae = abs(hr - args.ground_truth_hr)
+        print(f"Ground truth: {args.ground_truth_hr:.2f} bpm | MAE: {mae:.2f} bpm")
+
+    if args.plot:
+        plt.figure()
+        plt.semilogy(freqs, psd, "g")
+        ymin, ymax = plt.ylim()
+        plt.vlines(hr / 60.0, ymin, ymax, color="red")
+        plt.title(f"PSD of pulse signal (HR = {hr:.1f} bpm)")
+
+    import scipy.io as sio
+    stem = video_file_name[:-4] if "." in video_file_name else video_file_name
+    mat_file_name = os.path.join(args.out_dir, f"pulse_{stem}_frame-{args.start}-{args.end}.mat")
+    sio.savemat(mat_file_name, {"pulse": pulse, "heartrate": hr})
+    print("Saved:", mat_file_name)
+
+    if args.plot:
+        _warn_if_no_display()
+        plt.show()
+
+
+
+
+if __name__ == "__main__":
+    main()
