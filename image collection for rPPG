@@ -1,0 +1,52 @@
+import os
+import glob
+import numpy as np
+import rawpy
+import matplotlib.pyplot as plt
+from scipy.stats import shapiro, norm
+
+# Path to the directory where you saved your phone's RAW .dng photos
+dng_dir = "/home/rasadi/Desktop/phone_raw/"
+dng_files = sorted(glob.glob(os.path.join(dng_dir, "*.dng")))[:30]
+
+if len(dng_files) < 2:
+    print("Error: Please place at least 2 or more sequential .dng files in the directory.")
+    exit()
+
+print(f"Loading {len(dng_files)} RAW frames from phone...")
+frames = []
+
+for file_path in dng_files:
+    with rawpy.imread(file_path) as raw:
+        # Postprocess into a pure, unmanipulated raw grayscale pixel array
+        # half_size=True speeds up processing for large phone camera resolutions
+        rgb = raw.postprocess(use_camera_wb=True, half_size=True, no_auto_bright=True)
+        gray = np.mean(rgb, axis=2)
+        frames.append(gray)
+
+frames = np.array(frames, dtype=np.float32)
+print("Analysis complete! Calculating phone sensor noise...")
+
+# Extract noise residuals across the photo stack
+mean_frame = np.mean(frames, axis=0)
+target_frame = frames[int(len(frames) / 2)]
+noise_residuals = (target_frame - mean_frame).flatten()
+
+# Run the standard statistical validation sequence
+sampled_noise = np.random.choice(noise_residuals, size=5000, replace=False)
+stat, p_value = shapiro(sampled_noise)
+
+print("\n--- PHONE SENSOR RESULTS ---")
+print(f"Shapiro-Wilk Statistic: {stat:.4f}")
+print(f"p-value: {p_value:.5f}")
+
+# Plotting scripts remain completely identical to your original code
+plt.figure(figsize=(8, 5))
+plt.hist(sampled_noise, bins=50, density=True, alpha=0.6, color='b', label='Phone RAW Noise')
+mu, std = norm.fit(sampled_noise)
+xmin, xmax = plt.xlim()
+x = np.linspace(xmin, xmax, 100)
+plt.plot(x, norm.pdf(x, mu, std), 'k', linewidth=2, label=f'Ideal Gaussian (μ={mu:.2f}, σ={std:.2f})')
+plt.title("Smartphone Sensor Raw Photo Noise Analysis")
+plt.legend()
+plt.show()
