@@ -1,0 +1,81 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import shapiro, norm
+
+# 1. Initialize the live camera stream using Linux V4L2 backend
+cap = cv2.VideoCapture(1, cv2.CAP_V4L2)
+
+# 2. FORCE the Linux camera hardware to output raw, uncompressed YUYV pixels
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))
+
+# Set a standard resolution to ensure stable uncompressed USB bandwidth
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+# 3. Double-check if the Linux driver accepted the uncompressed format
+fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+codec = "".join([chr((fourcc >> 8 * i) & 0xFF) for i in range(4)])
+print(f"--- ACTIVE PIXEL FORMAT: {codec} ---")
+
+# 4. Collect 30 live, real-time frames
+print("Capturing live video frames... Please keep the camera perfectly still!")
+frames = []
+max_frames = 30
+
+while len(frames) < max_frames:
+    ret, frame = cap.read()
+    if not ret:
+        print("Failed to grab frame from Linux webcam.")
+        break
+
+    # Convert live frame to grayscale to analyze light intensity noise
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    frames.append(gray)
+
+cap.release()
+
+# 5. Check if we actually grabbed frames to prevent the empty math crash
+if len(frames) == 0:
+    print("Error: No frames were captured. Your webcam might be blocked or busy.")
+    exit()
+
+print("Capture complete! Analyzing noise distribution...")
+frames = np.array(frames, dtype=np.float32)
+
+# 6. Extract Noise: Subtract the time-averaged mean frame from a target frame
+mean_frame = np.mean(frames, axis=0)
+target_frame = frames[int(max_frames / 2)]
+noise_residuals = (target_frame - mean_frame).flatten()
+
+# Sample a subset for the statistical normality test
+sampled_noise = np.random.choice(noise_residuals, size=5000, replace=False)
+
+# 7. Apply the Shapiro-Wilk Normality Test
+stat, p_value = shapiro(sampled_noise)
+
+print("\n--- TEST RESULTS ---")
+print(f"Shapiro-Wilk Statistic: {stat:.4f}")
+print(f"p-value: {p_value:.5f}")
+
+if p_value > 0.05:
+    print("Verdict: The noise IS GAUSSIAN (Fail to reject normality).")
+else:
+    print("Verdict: The noise IS NOT GAUSSIAN.")
+
+# 8. Plot the visual results
+plt.figure(figsize=(8, 5))
+plt.hist(sampled_noise, bins=50, density=True, alpha=0.6, color='g', label='Live Raw Noise Data')
+
+# Overlay an ideal Gaussian curve for visual verification
+mu, std = norm.fit(sampled_noise)
+xmin, xmax = plt.xlim()
+x = np.linspace(xmin, xmax, 100)
+p = norm.pdf(x, mu, std)
+plt.plot(x, p, 'k', linewidth=2, label=f'Ideal Gaussian (μ={mu:.2f}, σ={std:.2f})')
+
+plt.title("Linux Real-Time (YUYV) Video Noise Distribution Analysis")
+plt.xlabel("Noise Amplitude Deviation")
+plt.ylabel("Density")
+plt.legend()
+plt.show()
