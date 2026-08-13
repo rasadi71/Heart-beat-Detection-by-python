@@ -1,0 +1,686 @@
+"""
+Real-time pulse extraction using the POS algorithm.
+
+This is a real-time streaming adaptation of the original offline
+pulse.py script. Per explicit request:
+
+    * pos_algorithm(), bandpass_filter(), estimate_heart_rate(), and all
+      of the MediaPipe-based face/skin ROI extraction (landmarks_to_pixels,
+      build_roi_mask, mean_skin_rgb, build_face_landmarker,
+      ensure_face_landmarker_model) are copied VERBATIM from the original
+      script. Nothing in the algorithm, filtering, or post-processing was
+      touched.
+    * The only thing that changed is the video-input / orchestration
+      layer: instead of reading a fixed [start, end) frame range from a
+      file and running the algorithm once at the end, this script:
+        1. streams frames continuously from a camera (or a file, paced
+           to real time) on the main thread, never blocking on HR
+           estimation,
+        2. builds a mean-RGB trace incrementally, one row per frame,
+        3. does NOT display any heart-rate value for the first 10
+           seconds (t = 0..11s exclusive) while it collects the initial
+           buffer,
+        4. at t = 11s, runs pos_algorithm/bandpass_filter/
+           estimate_heart_rate on the window covering samples 0..10s and
+           displays the result,
+        5. at t = 12s, runs the same algorithm on the window 0..11s and
+           updates the displayed value, at t = 13s on 0..12s, and so on
+           -- i.e. the window grows by one second every second, exactly
+           as specified, while acquisition keeps running uninterrupted
+           in the background.
+
+NOTE ON WINDOW SHAPE: the spec given ("0-10s", then "0-11s", then
+"0-12s"...) describes a window that starts at 0 and grows forever, not a
+fixed-width 10s buffer that slides forward (e.g. 1-11s, 2-12s, ...).
+This script implements the growing window exactly as specified. If a
+true fixed-width rolling 10s window is actually what's wanted, only
+`_process_window()`'s slicing needs to change (see the comment there).
+
+Requires: pip install mediapipe opencv-python scipy numpy
+"""
+
+import os
+import sys
+import time
+import bisect
+import threading
+import argparse
+import urllib.request
+
+import numpy as np
+import cv2
+from scipy.signal import welch, butter, filtfilt
+
+import mediapipe as mp
+from mediapipe.tasks.python.core.base_options import BaseOptions
+from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
+    VisionTaskRunningMode,
+)
+from mediapipe.tasks.python.vision.face_landmarker import (
+    FaceLandmarker,
+    FaceLandmarkerOptions,
+    FaceLandmarksConnections,
+)
+
+sys.path.insert(0, "./SkinDetector")
+import skin_detector  # noqa: E402
+
+FACE_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+
+
+# =============================================================================
+# EVERYTHING IN THIS SECTION IS UNCHANGED FROM THE ORIGINAL OFFLINE SCRIPT.
+# Face/skin ROI extraction (MediaPipe Face Landmarker, 478 landmarks)
+# =============================================================================
+
+def ensure_face_landmarker_model(model_path):
+    """Download the official face_landmarker.task bundle if not already
+    present locally."""
+    if os.path.exists(model_path):
+        return model_path
+    print(f"Downloading Face Landmarker model to {model_path} ...")
+    try:
+        urllib.request.urlretrieve(FACE_LANDMARKER_MODEL_URL, model_path)
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not download {FACE_LANDMARKER_MODEL_URL} ({e}). "
+            f"If this network is blocked, download the file manually from "
+            f"that URL and pass its path via --face_model."
+        )
+    return model_path
+
+
+def build_face_landmarker(model_path):
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionTaskRunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return FaceLandmarker.create_from_options(options)
+
+
+def _connection_indices(connections):
+    idx = set()
+    for c in connections:
+        idx.add(c.start)
+        idx.add(c.end)
+    return sorted(idx)
+
+
+_FACE_OVAL_IDX = _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_FACE_OVAL)
+_EXCLUDE_IDX_GROUPS = [
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYE),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYE),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYEBROW),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYEBROW),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LIPS),
+]
+
+
+def _dilate_hull(hull_pts, pad_ratio):
+    pts = hull_pts.reshape(-1, 2).astype(np.float32)
+    centroid = pts.mean(axis=0)
+    pts = centroid + (pts - centroid) * (1.0 + pad_ratio)
+    return pts.astype(np.int32).reshape(-1, 1, 2)
+
+
+def landmarks_to_pixels(face_landmarks, frame_shape):
+    h, w = frame_shape[:2]
+    pts = np.array([[lm.x * w, lm.y * h] for lm in face_landmarks], dtype=np.float32)
+    return pts
+
+
+def build_roi_mask(frame_shape, landmarks_px):
+    h, w = frame_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    oval_pts = landmarks_px[_FACE_OVAL_IDX].astype(np.int32)
+    oval_hull = cv2.convexHull(oval_pts)
+    cv2.fillConvexPoly(mask, oval_hull, 255)
+
+    for group_idx in _EXCLUDE_IDX_GROUPS:
+        pts = landmarks_px[group_idx].astype(np.int32)
+        hull = cv2.convexHull(pts)
+        hull = _dilate_hull(hull, pad_ratio=0.35)
+        cv2.fillConvexPoly(mask, hull, 0)
+
+    return mask, cv2.boundingRect(oval_hull)  # (x, y, w, h)
+
+
+def mean_skin_rgb(frame_bgr, landmark_mask, use_color_skin_mask=True):
+    mask = landmark_mask
+    if use_color_skin_mask:
+        color_mask = skin_detector.process(frame_bgr)
+        mask = cv2.bitwise_and(mask, color_mask)
+
+    masked_face = cv2.bitwise_and(frame_bgr, frame_bgr, mask=mask)
+    n_skin = int(np.sum(mask > 0))
+    if n_skin == 0:
+        return None
+    r = np.sum(masked_face[:, :, 2]) / n_skin
+    g = np.sum(masked_face[:, :, 1]) / n_skin
+    b = np.sum(masked_face[:, :, 0]) / n_skin
+    return r, g, b
+
+
+# =============================================================================
+# UNCHANGED: POS algorithm
+# =============================================================================
+
+def pos_algorithm(mean_rgb, framerate, window_seconds=1.6, eps=1e-9, combine_method="alpha"):
+    n = mean_rgb.shape[0]
+    l = int(round(framerate * window_seconds))
+    l = max(l, 2)
+
+    H = np.zeros(n)
+    projection_matrix = np.array([[0, 1, -1], [-2, 1, 1]])
+    identity_2x2 = np.eye(2)
+
+    for t in range(0, n - l + 1):
+        C = mean_rgb[t:t + l, :].T  # (3, l)
+
+        mean_color = np.mean(C, axis=1)
+        mean_color = np.where(np.abs(mean_color) < eps, eps, mean_color)
+        diag_mean_color_inv = np.diag(1.0 / mean_color)
+
+        Cn = diag_mean_color_inv @ C
+        S = projection_matrix @ Cn  # (2, l)
+
+        if combine_method == "svd":
+            try:
+                U, _sing, _Vt = np.linalg.svd(S, full_matrices=False)
+            except np.linalg.LinAlgError:
+                continue
+            q1 = U[:, 0]
+            proj = identity_2x2 - np.outer(q1, q1)
+            u = proj @ S
+            P = u[0, :]
+        else:  # "alpha" (default, original POS)
+            std0 = np.std(S[0, :])
+            std1 = np.std(S[1, :])
+            alpha = std0 / std1 if std1 > eps else 0.0
+            std_vec = np.array([1.0, alpha])
+            P = std_vec @ S
+
+        p_std = np.std(P)
+        if p_std < eps:
+            continue
+        H[t:t + l] += (P - np.mean(P)) / p_std
+
+    return H
+
+
+# =============================================================================
+# UNCHANGED: band-pass filter + HR estimation
+# =============================================================================
+
+def bandpass_filter(signal, framerate, low_hz=0.7, high_hz=3.5, order=3):
+    nyq = framerate / 2.0
+    low = max(low_hz / nyq, 1e-4)
+    high = min(high_hz / nyq, 0.999)
+    b, a = butter(order, [low, high], btype="bandpass")
+    padlen = 3 * max(len(a), len(b))
+    if len(signal) <= padlen:
+        padlen = max(len(signal) - 1, 0)
+    return filtfilt(b, a, signal, padlen=padlen)
+
+
+def estimate_heart_rate(signal, framerate, low_hz=0.7, high_hz=3.5, nsegments=12,
+                         freq_resolution_hz=0.01):
+    segment_length = (2 * signal.shape[0]) // (nsegments + 1)
+    segment_length = max(segment_length, 8)
+    segment_length = min(segment_length, signal.shape[0])
+
+    nfft = 1
+    target = int(framerate / freq_resolution_hz)
+    while nfft < max(segment_length, target):
+        nfft *= 2
+
+    f, psd = welch(signal, framerate, window="hamming",
+                    nperseg=segment_length, nfft=nfft)
+
+    band = np.where((f >= low_hz) & (f <= high_hz))[0]
+    if band.size == 0:
+        raise RuntimeError("No frequency bins fall inside the requested HR band.")
+
+    max_idx = np.argmax(psd[band])
+    f_max = f[band[max_idx]]
+    hr = f_max * 60.0
+    return hr, f, psd
+
+
+# =============================================================================
+# NEW: per-frame ROI/RGB extraction, factored out of the original offline
+# while-loop so the real-time path uses the exact same per-frame logic
+# (landmark detection -> gap reuse -> ROI mask -> skin-color mask -> mean
+# RGB) as the offline script did. No detection/masking math changed.
+# =============================================================================
+
+def process_single_frame(frame, landmarker, timestamp_ms, last_landmarks_px,
+                          gap_count, max_gap, use_color_skin_mask=True,
+                          image_show=False):
+    """One iteration of the original extract_mean_rgb_trace() loop body.
+
+    Returns (rgb_or_None, last_landmarks_px, gap_count).
+    """
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    result = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+    landmarks_px = None
+    if result.face_landmarks:
+        landmarks_px = landmarks_to_pixels(result.face_landmarks[0], frame.shape)
+        last_landmarks_px = landmarks_px
+        gap_count = 0
+    elif last_landmarks_px is not None and gap_count < max_gap:
+        landmarks_px = last_landmarks_px
+        gap_count += 1
+
+    rgb = None
+    if landmarks_px is not None:
+        mask, (bx, by, bw, bh) = build_roi_mask(frame.shape, landmarks_px)
+        if bw > 0 and bh > 0:
+            face_crop = frame[by:by + bh, bx:bx + bw]
+            mask_crop = mask[by:by + bh, bx:bx + bw]
+            if face_crop.size > 0:
+                rgb = mean_skin_rgb(face_crop, mask_crop, use_color_skin_mask)
+            if image_show:
+                cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
+
+    return rgb, last_landmarks_px, gap_count
+
+
+# =============================================================================
+# NEW: real-time streaming + growing-window scheduler
+# =============================================================================
+
+class RealTimeHeartRateMonitor:
+    """
+    Owns the growing mean-RGB trace and a background thread that, once a
+    second, runs the (unmodified) POS -> band-pass -> HR-estimation
+    pipeline on the samples collected so far and updates `current_hr`.
+
+    IMPORTANT: `framerate` is only a *fallback/nominal* value. Frames are
+    timestamped with the real wall-clock time they were captured at, and
+    windows are selected by real elapsed time, not by assuming frames
+    arrive exactly `framerate` times per second. The *actual* achieved
+    sample rate within each window is what actually gets passed to
+    pos_algorithm/bandpass_filter/estimate_heart_rate -- because if
+    real capture throughput is lower than the nominal `framerate` (very
+    common: MediaPipe + skin-color masking per frame is expensive) but
+    the algorithm is told samples arrived faster than they really did,
+    every Hz-based calculation (band-pass cutoffs, Welch bin -> bpm
+    conversion) comes out scaled wrong, which is what was producing the
+    climbing/inflated bpm values and shrinking sample counts.
+
+    Timeline (t = seconds since start_time), true fixed-width rolling
+    buffer of length `buffer_seconds` (default 10s), sliding by 1s every
+    second:
+        t in [0, start_display_at)      : no HR displayed, frames still collected
+        t == start_display_at (11)      : process window [0, 10)s      -> display
+        t == start_display_at+1 (12)    : process window [1, 11)s      -> display
+        t == start_display_at+2 (13)    : process window [2, 12)s      -> display
+        ... window keeps the same buffer_seconds width and shifts by 1s
+        every second, forever, while acquisition continues uninterrupted.
+    """
+
+    def __init__(self, framerate, start_display_at=11, buffer_seconds=10.0,
+                 window_seconds=1.6, pos_combine="alpha", low_hz=0.7,
+                 high_hz=3.5, nsegments=12, verbose=True):
+        self.framerate = framerate  # nominal fallback only, see class docstring
+        self.start_display_at = start_display_at
+        self.buffer_seconds = buffer_seconds
+        self.window_seconds = window_seconds
+        self.pos_combine = pos_combine
+        self.low_hz = low_hz
+        self.high_hz = high_hz
+        self.nsegments = nsegments
+        self.verbose = verbose
+
+        self._trace = []       # rolling list of [r, g, b] rows
+        self._timestamps = []  # parallel list: seconds since start_time for each row
+        self._total_appended = 0
+        # Keep a little extra history past what a window needs, so the
+        # capture thread trimming never races ahead of what the
+        # estimation thread is about to read.
+        self._keep_seconds = buffer_seconds + 2.0
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+
+        self.start_time = None
+        self.current_hr = None          # None until the first window has been processed
+        self.last_pulse_signal = None   # most recent band-passed pulse, for optional plotting
+        self.last_psd = None            # (freqs, psd) of the most recent estimate
+        self.last_effective_fps = None  # actual achieved fps in the most recent window
+
+    # -- called continuously from the capture loop (main thread) --------- #
+    def append_sample(self, rgb, timestamp_seconds=None):
+        with self._lock:
+            if timestamp_seconds is None:
+                timestamp_seconds = (time.time() - self.start_time) if self.start_time else 0.0
+            self._trace.append(list(rgb))
+            self._timestamps.append(timestamp_seconds)
+            self._total_appended += 1
+
+            # Bound memory: drop rows older than any future window could
+            # still need. Timestamps are strictly increasing, so a
+            # bisect finds the cut point in O(log n); the actual removal
+            # is O(k) in the number of dropped rows.
+            cutoff = timestamp_seconds - self._keep_seconds
+            n_drop = bisect.bisect_left(self._timestamps, cutoff)
+            if n_drop > 0:
+                del self._trace[:n_drop]
+                del self._timestamps[:n_drop]
+
+    def n_samples(self):
+        with self._lock:
+            return self._total_appended
+
+    # -- lifecycle ---------------------------------------------------------#
+    def start(self):
+        self.start_time = time.time()
+        self._thread = threading.Thread(target=self._estimation_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    # -- background scheduler --------------------------------------------#
+    def _estimation_loop(self):
+        next_tick = self.start_time + self.start_display_at
+        while not self._stop_event.is_set():
+            now = time.time()
+            wait = next_tick - now
+            if wait > 0:
+                # Sleep in short slices so stop() is responsive.
+                self._stop_event.wait(timeout=min(wait, 0.1))
+                continue
+
+            elapsed_seconds = next_tick - self.start_time  # 11, 12, 13, ...
+            window_end_seconds = elapsed_seconds - 1        # 10, 11, 12, ...
+            self._process_window(window_end_seconds, elapsed_seconds)
+
+            # Advance to the next second. If we fell behind (processing
+            # took >1s), skip forward rather than firing a burst of
+            # back-to-back catch-up windows.
+            next_tick += 1.0
+            if next_tick < time.time():
+                next_tick = time.time() + 1.0
+
+    def _process_window(self, window_end_seconds, display_at_seconds):
+        with self._lock:
+            trace_snapshot = list(self._trace)
+            ts_snapshot = list(self._timestamps)
+
+        # Fixed-width rolling window: [window_start, window_end) seconds,
+        # buffer_seconds wide, sliding forward by 1s each call --
+        # (0,10) -> (1,11) -> (2,12) -> ... Selected by REAL elapsed
+        # time, not by assuming a fixed nominal sample rate.
+        window_start_seconds = max(0.0, window_end_seconds - self.buffer_seconds)
+        start_idx = bisect.bisect_left(ts_snapshot, window_start_seconds)
+        end_idx = bisect.bisect_left(ts_snapshot, window_end_seconds)
+        n = end_idx - start_idx
+        if n < 2:
+            return
+
+        window_rgb = np.array(trace_snapshot[start_idx:end_idx], dtype=float)
+
+        # Actual achieved sample rate across this exact window, from real
+        # timestamps -- this is what gets fed to the (unmodified)
+        # algorithm, not the nominal --framerate value, since the
+        # algorithm's Hz<->bpm math is only correct if the framerate it's
+        # told matches the real spacing between the samples it receives.
+        span = ts_snapshot[end_idx - 1] - ts_snapshot[start_idx]
+        effective_fps = (n - 1) / span if span > 1e-6 else self.framerate
+        self.last_effective_fps = effective_fps
+
+        raw_pulse = pos_algorithm(
+            window_rgb, effective_fps,
+            window_seconds=self.window_seconds,
+            combine_method=self.pos_combine,
+        )
+        pulse = bandpass_filter(raw_pulse, effective_fps, self.low_hz, self.high_hz)
+        hr, freqs, psd = estimate_heart_rate(
+            pulse, effective_fps, self.low_hz, self.high_hz, self.nsegments,
+        )
+
+        self.current_hr = hr
+        self.last_pulse_signal = pulse
+        self.last_psd = (freqs, psd)
+
+        if self.verbose:
+            fps_note = ""
+            if effective_fps < 0.8 * self.framerate:
+                fps_note = (f"  [WARNING: actual fps {effective_fps:.1f} is well "
+                             f"below nominal --framerate {self.framerate:.1f}; "
+                             f"capture/processing can't keep up]")
+            print(f"[t={display_at_seconds:.0f}s] window={window_start_seconds:.1f}-"
+                  f"{window_end_seconds:.1f}s ({n} samples, {effective_fps:.1f} fps) "
+                  f"-> HR = {hr:.2f} bpm{fps_note}")
+
+
+# =============================================================================
+# NEW: main capture loop
+# =============================================================================
+
+def open_camera(camera_index, use_dshow=True, fourcc="YUY2"):
+    """
+    Open a live camera, requesting an uncompressed pixel format instead
+    of whatever the driver defaults to (commonly MJPEG, which is
+    already-compressed and can introduce compression artifacts into the
+    RGB trace before the algorithm ever sees it).
+
+    On Windows, cv2.CAP_DSHOW (DirectShow) is what lets OpenCV actually
+    honor a CAP_PROP_FOURCC request like YUY2 -- the default backend
+    often ignores it and silently keeps MJPEG. This only applies to a
+    live camera (--video file playback is unaffected either way, since a
+    file's encoding is already fixed).
+
+    On non-Windows platforms CAP_DSHOW doesn't exist, so this falls back
+    to the default backend; FOURCC is still requested but the OS/driver
+    may or may not honor it (Linux's V4L2 backend generally does support
+    an explicit FOURCC request, e.g. 'YUYV').
+    """
+    if use_dshow and sys.platform.startswith("win"):
+        camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    else:
+        camera = cv2.VideoCapture(camera_index)
+
+    if fourcc:
+        try:
+            camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+        except Exception as e:
+            print(f"WARNING: could not request FOURCC '{fourcc}' ({e}); "
+                  f"continuing with the camera's default format.")
+
+    return camera
+
+
+def _gui_available():
+    """Probe whether this OpenCV build actually has a GUI backend (GTK/Qt/
+    Cocoa/Win32) compiled in. Headless builds (e.g. many conda-forge
+    libopencv installs, or opencv-python-headless) raise cv2.error with
+    'not implemented' the moment imshow/destroyAllWindows is called -- so
+    we check once up front rather than crashing mid-stream."""
+    try:
+        cv2.namedWindow("__gui_probe__", cv2.WINDOW_NORMAL)
+        cv2.destroyWindow("__gui_probe__")
+        return True
+    except cv2.error:
+        return False
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-v", "--video",
+                     help="optional video file to stream instead of a live "
+                          "camera (paced to real time via sleep, so the "
+                          "same 1s-per-window schedule applies)")
+    ap.add_argument("--camera_index", type=int, default=0,
+                     help="camera device index to use when --video is not given")
+    ap.add_argument("--framerate", type=float, default=30.0,
+                     help="nominal capture framerate; must match the camera's "
+                          "actual rate for the HR math to be correct")
+    ap.add_argument("--face_model", default="face_landmarker.task")
+    ap.add_argument("--no_color_skin_mask", action="store_true")
+    ap.add_argument("--window_seconds", type=float, default=1.6,
+                     help="POS sliding-window length in seconds (paper default 1.6s)")
+    ap.add_argument("--pos_combine", choices=["alpha", "svd"], default="alpha")
+    ap.add_argument("--low_hz", type=float, default=0.7)
+    ap.add_argument("--high_hz", type=float, default=3.5)
+    ap.add_argument("--max_gap", type=int, default=5,
+                     help="max consecutive frames to bridge with the last known face box")
+    ap.add_argument("--nsegments", type=int, default=12)
+    ap.add_argument("--start_display_at", type=float, default=11.0,
+                     help="second at which the first HR value is computed/shown")
+    ap.add_argument("--buffer_seconds", type=float, default=10.0,
+                     help="width of the rolling window in seconds (default 10s)")
+    ap.add_argument("--image_show", action="store_true",
+                     help="show a live window with the camera feed and HR overlay")
+    ap.add_argument("--fourcc", default="YUY2",
+                     help="pixel format to request from a live camera (default "
+                          "YUY2, uncompressed). Pass '' to leave the camera's "
+                          "default (often MJPEG) untouched.")
+    ap.add_argument("--no_dshow", action="store_true",
+                     help="on Windows, don't force the DirectShow backend "
+                          "(needed for --fourcc to actually take effect there)")
+    args = ap.parse_args()
+
+    if args.video:
+        camera = cv2.VideoCapture(1)
+        is_file = True
+    else:
+        camera = open_camera(1, use_dshow=not args.no_dshow,
+                              fourcc=args.fourcc)
+        is_file = False
+    if not camera.isOpened():
+        raise RuntimeError("Cannot open video source.")
+
+    model_path = ensure_face_landmarker_model(args.face_model)
+    landmarker = build_face_landmarker(model_path)
+
+    monitor = RealTimeHeartRateMonitor(
+        framerate=args.framerate,
+        start_display_at=args.start_display_at,
+        buffer_seconds=args.buffer_seconds,
+        window_seconds=args.window_seconds,
+        pos_combine=args.pos_combine,
+        low_hz=args.low_hz,
+        high_hz=args.high_hz,
+        nsegments=args.nsegments,
+    )
+
+    # MediaPipe's VIDEO mode requires a strictly monotonically increasing
+    # timestamp_ms. We use real wall-clock elapsed time (matching the
+    # same clock the trace timestamps use), with a tiny fallback bump in
+    # the rare case two frames land in the same millisecond.
+    last_timestamp_ms = -1
+    last_landmarks_px = None
+    gap_count = 0
+    frame_interval = 1.0 / args.framerate
+
+    image_show = args.image_show
+    if image_show and not _gui_available():
+        print("WARNING: --image_show was requested but this OpenCV build "
+              "has no GUI backend (headless build -- see error you'd "
+              "otherwise get from cv2.imshow). Falling back to console-only "
+              "output. To fix: pip uninstall opencv-python-headless -y && "
+              "pip install opencv-python (or `conda install -c conda-forge "
+              "opencv` in a conda env).")
+        image_show = False
+
+    print(f"Streaming... collecting baseline for {args.start_display_at:.0f}s "
+          f"before the first HR estimate is shown.")
+
+    monitor.start()
+    try:
+        while True:
+            loop_start = time.time()
+
+            grabbed, frame = camera.read()
+            if not grabbed:
+                print("End of stream / camera read failed.")
+                break
+
+            timestamp_ms = int(round((time.time() - monitor.start_time) * 1000.0))
+            if timestamp_ms <= last_timestamp_ms:
+                timestamp_ms = last_timestamp_ms + 1
+            last_timestamp_ms = timestamp_ms
+
+            rgb, last_landmarks_px, gap_count = process_single_frame(
+                frame, landmarker, timestamp_ms, last_landmarks_px, gap_count,
+                args.max_gap, use_color_skin_mask=not args.no_color_skin_mask,
+                image_show=image_show,
+            )
+
+            if rgb is None:
+                # No face yet at all (startup) -- nothing usable to append.
+                # Once a face has been seen at least once, causally reuse
+                # the last valid sample instead of waiting for a future
+                # frame to interpolate against (there is no "future" in
+                # real time).
+                if monitor.n_samples() > 0:
+                    with monitor._lock:
+                        rgb = tuple(monitor._trace[-1])
+
+            if rgb is not None:
+                monitor.append_sample(rgb)
+
+            if image_show:
+                elapsed = time.time() - monitor.start_time
+                if monitor.current_hr is not None:
+                    label = f"HR: {monitor.current_hr:.1f} bpm"
+                    color = (0, 255, 0)
+                else:
+                    remaining = max(0.0, args.start_display_at - elapsed)
+                    label = f"Collecting baseline... {remaining:.1f}s"
+                    color = (0, 165, 255)
+                cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.9, color, 2, cv2.LINE_AA)
+                try:
+                    cv2.imshow("Real-time rPPG", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                except cv2.error as e:
+                    print(f"WARNING: display window failed ({e}); "
+                          f"continuing in console-only mode.")
+                    image_show = False
+
+            if is_file:
+                # Pace file playback to real time so the 1s-per-window
+                # schedule behaves the same as it would with a live camera.
+                elapsed_loop = time.time() - loop_start
+                sleep_left = frame_interval - elapsed_loop
+                if sleep_left > 0:
+                    time.sleep(sleep_left)
+    except KeyboardInterrupt:
+        print("Interrupted by user.")
+    finally:
+        monitor.stop()
+        camera.release()
+        landmarker.close()
+        if image_show:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
+
+    if monitor.current_hr is not None:
+        print(f"Final displayed heart rate: {monitor.current_hr:.2f} bpm")
+    else:
+        print("Stream ended before the first HR estimate could be computed "
+              f"(needs >= {args.start_display_at:.0f}s of footage with a "
+              "detected face).")
+
+
+if __name__ == "__main__":
+    main()
