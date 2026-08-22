@@ -1,0 +1,962 @@
+"""
+Real-time pulse extraction using the POS algorithm.
+
+pos_algorithm(), bandpass_filter(), estimate_heart_rate(), and all of the
+MediaPipe-based face/skin ROI extraction (landmarks_to_pixels,
+build_roi_mask, mean_skin_rgb, build_face_landmarker,
+ensure_face_landmarker_model) are copied VERBATIM and never touched by
+any of the tracker/diagnostics work below.
+
+# ===== KCF TRACKER CHANGE =====
+Default tracker changed from MOSSE to KCF. The tracker/orchestration
+layer (FaceROITracker) now also:
+  - explicitly verifies KCF availability at startup instead of assuming
+    it (§3), with a big, unmissable banner if it's missing,
+  - labels every re-detection with a specific reason code (§10) so
+    "tracker never engages" (unavailable) can be told apart from
+    "tracker engages but fails immediately" (update() False) from
+    "tracker succeeds but gets geometrically rejected",
+  - never permanently disables itself after a single runtime failure
+    (only after a hard capability check fails at startup) (§5/§6).
+# ===== PERFORMANCE DIAGNOSTICS =====
+The per-second HR summary now prints the full 10-second-window block
+format requested (MediaPipe/KCF frame counts, usage %, re-detections,
+tracker failures, capture-vs-nominal FPS), and a final end-of-run
+performance summary is printed on exit. All of this is diagnostic
+printing layered around the exact same unmodified pos_algorithm /
+bandpass_filter / estimate_heart_rate calls as before -- the actual
+HR math is untouched.
+
+Requires: pip install mediapipe opencv-python scipy numpy
+(opencv-contrib-python required for KCF/MOSSE trackers)
+"""
+
+import os
+import sys
+import time
+import bisect
+import threading
+import argparse
+import statistics
+import urllib.request
+
+import numpy as np
+import cv2
+from scipy.signal import welch, butter, filtfilt
+
+import mediapipe as mp
+from mediapipe.tasks.python.core.base_options import BaseOptions
+from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
+    VisionTaskRunningMode,
+)
+from mediapipe.tasks.python.vision.face_landmarker import (
+    FaceLandmarker,
+    FaceLandmarkerOptions,
+    FaceLandmarksConnections,
+)
+
+sys.path.insert(0, "./SkinDetector")
+import skin_detector  # noqa: E402
+
+FACE_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+
+
+def ensure_face_landmarker_model(model_path):
+    if os.path.exists(model_path):
+        return model_path
+    print(f"Downloading Face Landmarker model to {model_path} ...")
+    try:
+        urllib.request.urlretrieve(FACE_LANDMARKER_MODEL_URL, model_path)
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not download {FACE_LANDMARKER_MODEL_URL} ({e}). "
+            f"If this network is blocked, download the file manually from "
+            f"that URL and pass its path via --face_model."
+        )
+    return model_path
+
+
+def build_face_landmarker(model_path):
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionTaskRunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return FaceLandmarker.create_from_options(options)
+
+
+def _connection_indices(connections):
+    idx = set()
+    for c in connections:
+        idx.add(c.start)
+        idx.add(c.end)
+    return sorted(idx)
+
+
+_FACE_OVAL_IDX = _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_FACE_OVAL)
+_EXCLUDE_IDX_GROUPS = [
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYE),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYE),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYEBROW),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYEBROW),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LIPS),
+]
+
+
+def _dilate_hull(hull_pts, pad_ratio):
+    pts = hull_pts.reshape(-1, 2).astype(np.float32)
+    centroid = pts.mean(axis=0)
+    pts = centroid + (pts - centroid) * (1.0 + pad_ratio)
+    return pts.astype(np.int32).reshape(-1, 1, 2)
+
+
+def landmarks_to_pixels(face_landmarks, frame_shape):
+    h, w = frame_shape[:2]
+    pts = np.array([[lm.x * w, lm.y * h] for lm in face_landmarks], dtype=np.float32)
+    return pts
+
+
+def build_roi_mask(frame_shape, landmarks_px):
+    h, w = frame_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    oval_pts = landmarks_px[_FACE_OVAL_IDX].astype(np.int32)
+    oval_hull = cv2.convexHull(oval_pts)
+    cv2.fillConvexPoly(mask, oval_hull, 255)
+
+    for group_idx in _EXCLUDE_IDX_GROUPS:
+        pts = landmarks_px[group_idx].astype(np.int32)
+        hull = cv2.convexHull(pts)
+        hull = _dilate_hull(hull, pad_ratio=0.35)
+        cv2.fillConvexPoly(mask, hull, 0)
+
+    return mask, cv2.boundingRect(oval_hull)  # (x, y, w, h)
+
+
+def mean_skin_rgb(frame_bgr, landmark_mask, use_color_skin_mask=True):
+    mask = landmark_mask
+    if use_color_skin_mask:
+        color_mask = skin_detector.process(frame_bgr)
+        mask = cv2.bitwise_and(mask, color_mask)
+
+    masked_face = cv2.bitwise_and(frame_bgr, frame_bgr, mask=mask)
+    n_skin = int(np.sum(mask > 0))
+    if n_skin == 0:
+        return None
+    r = np.sum(masked_face[:, :, 2]) / n_skin
+    g = np.sum(masked_face[:, :, 1]) / n_skin
+    b = np.sum(masked_face[:, :, 0]) / n_skin
+    return r, g, b
+
+
+def pos_algorithm(mean_rgb, framerate, window_seconds=1.6, eps=1e-9, combine_method="alpha"):
+    n = mean_rgb.shape[0]
+    l = int(round(framerate * window_seconds))
+    l = max(l, 2)
+
+    H = np.zeros(n)
+    projection_matrix = np.array([[0, 1, -1], [-2, 1, 1]])
+    identity_2x2 = np.eye(2)
+
+    for t in range(0, n - l + 1):
+        C = mean_rgb[t:t + l, :].T  # (3, l)
+
+        mean_color = np.mean(C, axis=1)
+        mean_color = np.where(np.abs(mean_color) < eps, eps, mean_color)
+        diag_mean_color_inv = np.diag(1.0 / mean_color)
+
+        Cn = diag_mean_color_inv @ C
+        S = projection_matrix @ Cn  # (2, l)
+
+        if combine_method == "svd":
+            try:
+                U, _sing, _Vt = np.linalg.svd(S, full_matrices=False)
+            except np.linalg.LinAlgError:
+                continue
+            q1 = U[:, 0]
+            proj = identity_2x2 - np.outer(q1, q1)
+            u = proj @ S
+            P = u[0, :]
+        else:  # "alpha" (default, original POS)
+            std0 = np.std(S[0, :])
+            std1 = np.std(S[1, :])
+            alpha = std0 / std1 if std1 > eps else 0.0
+            std_vec = np.array([1.0, alpha])
+            P = std_vec @ S
+
+        p_std = np.std(P)
+        if p_std < eps:
+            continue
+        H[t:t + l] += (P - np.mean(P)) / p_std
+
+    return H
+
+
+def bandpass_filter(signal, framerate, low_hz=0.7, high_hz=3.5, order=3):
+    nyq = framerate / 2.0
+    low = max(low_hz / nyq, 1e-4)
+    high = min(high_hz / nyq, 0.999)
+    b, a = butter(order, [low, high], btype="bandpass")
+    padlen = 3 * max(len(a), len(b))
+    if len(signal) <= padlen:
+        padlen = max(len(signal) - 1, 0)
+    return filtfilt(b, a, signal, padlen=padlen)
+
+
+def estimate_heart_rate(signal, framerate, low_hz=0.7, high_hz=3.5, nsegments=12,
+                         freq_resolution_hz=0.01):
+    segment_length = (2 * signal.shape[0]) // (nsegments + 1)
+    segment_length = max(segment_length, 8)
+    segment_length = min(segment_length, signal.shape[0])
+
+    nfft = 1
+    target = int(framerate / freq_resolution_hz)
+    while nfft < max(segment_length, target):
+        nfft *= 2
+
+    f, psd = welch(signal, framerate, window="hamming",
+                    nperseg=segment_length, nfft=nfft)
+
+    band = np.where((f >= low_hz) & (f <= high_hz))[0]
+    if band.size == 0:
+        raise RuntimeError("No frequency bins fall inside the requested HR band.")
+
+    max_idx = np.argmax(psd[band])
+    f_max = f[band[max_idx]]
+    hr = f_max * 60.0
+    return hr, f, psd
+
+
+# =============================================================================
+# UNCHANGED (algorithm calls): real-time streaming + rolling-window
+# scheduler. pos_algorithm/bandpass_filter/estimate_heart_rate calls
+# themselves are byte-identical to before.
+#
+# ===== PERFORMANCE DIAGNOSTICS =====
+# Added: a parallel per-sample mode/reason log (which frames in this
+# window were MediaPipe vs tracker, and why any re-detections happened),
+# so the window summary can report the exact §11/§12 format. This never
+# feeds into the HR math -- it's read-only bookkeeping alongside the
+# already-existing rgb/timestamp trace.
+# =============================================================================
+
+class RealTimeHeartRateMonitor:
+    """
+    Owns the growing mean-RGB trace and a background thread that, once a
+    second, runs the (unmodified) POS -> band-pass -> HR-estimation
+    pipeline on the samples collected so far and updates `current_hr`.
+
+    `framerate` is only a *fallback/nominal* value. Frames are
+    timestamped with the real wall-clock time they were captured at, and
+    windows are selected by real elapsed time. The *actual* achieved
+    sample rate within each window is what gets passed to
+    pos_algorithm/bandpass_filter/estimate_heart_rate.
+
+    Fixed-width rolling buffer of length `buffer_seconds` (default 10s),
+    sliding by 1s every second, starting at `start_display_at`.
+    """
+
+    def __init__(self, framerate, start_display_at=11, buffer_seconds=10.0,
+                 window_seconds=1.6, pos_combine="alpha", low_hz=0.7,
+                 high_hz=3.5, nsegments=12, verbose=True, tracker_label="KCF"):
+        self.framerate = framerate  # nominal fallback only, see class docstring
+        self.start_display_at = start_display_at
+        self.buffer_seconds = buffer_seconds
+        self.window_seconds = window_seconds
+        self.pos_combine = pos_combine
+        self.low_hz = low_hz
+        self.high_hz = high_hz
+        self.nsegments = nsegments
+        self.verbose = verbose
+        self.tracker_label = tracker_label  # display label only, e.g. "KCF"/"MOSSE"/"NONE"
+
+        self._trace = []       # rolling list of [r, g, b] rows
+        self._timestamps = []  # parallel: seconds since start_time for each row
+        self._mode_log = []    # parallel: True=MediaPipe frame, False=tracker frame
+        self._reason_log = []  # parallel: None, "INITIAL", or a failure-reason code
+        self._total_appended = 0
+        self._keep_seconds = buffer_seconds + 2.0
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+
+        self.start_time = None
+        self.current_hr = None
+        self.last_pulse_signal = None
+        self.last_psd = None
+        self.last_effective_fps = None
+        self.hr_history = []   # every HR value ever computed, for the final summary
+
+    def append_sample(self, rgb, timestamp_seconds=None, used_mediapipe=None, reason=None):
+        with self._lock:
+            if timestamp_seconds is None:
+                timestamp_seconds = (time.time() - self.start_time) if self.start_time else 0.0
+            self._trace.append(list(rgb))
+            self._timestamps.append(timestamp_seconds)
+            self._mode_log.append(used_mediapipe)
+            self._reason_log.append(reason)
+            self._total_appended += 1
+
+            cutoff = timestamp_seconds - self._keep_seconds
+            n_drop = bisect.bisect_left(self._timestamps, cutoff)
+            if n_drop > 0:
+                del self._trace[:n_drop]
+                del self._timestamps[:n_drop]
+                del self._mode_log[:n_drop]
+                del self._reason_log[:n_drop]
+
+    def n_samples(self):
+        with self._lock:
+            return self._total_appended
+
+    def start(self):
+        self.start_time = time.time()
+        self._thread = threading.Thread(target=self._estimation_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _estimation_loop(self):
+        next_tick = self.start_time + self.start_display_at
+        while not self._stop_event.is_set():
+            now = time.time()
+            wait = next_tick - now
+            if wait > 0:
+                self._stop_event.wait(timeout=min(wait, 0.1))
+                continue
+
+            elapsed_seconds = next_tick - self.start_time
+            window_end_seconds = elapsed_seconds - 1
+            self._process_window(window_end_seconds, elapsed_seconds)
+
+            next_tick += 1.0
+            if next_tick < time.time():
+                next_tick = time.time() + 1.0
+
+    def _process_window(self, window_end_seconds, display_at_seconds):
+        with self._lock:
+            trace_snapshot = list(self._trace)
+            ts_snapshot = list(self._timestamps)
+            mode_snapshot = list(self._mode_log)
+            reason_snapshot = list(self._reason_log)
+
+        window_start_seconds = max(0.0, window_end_seconds - self.buffer_seconds)
+        start_idx = bisect.bisect_left(ts_snapshot, window_start_seconds)
+        end_idx = bisect.bisect_left(ts_snapshot, window_end_seconds)
+        n = end_idx - start_idx
+        if n < 2:
+            return
+
+        window_rgb = np.array(trace_snapshot[start_idx:end_idx], dtype=float)
+
+        # ===== UNCHANGED: actual achieved sample rate from real timestamps,
+        # fed into the exact same, untouched algorithm functions. =====
+        span = ts_snapshot[end_idx - 1] - ts_snapshot[start_idx]
+        effective_fps = (n - 1) / span if span > 1e-6 else self.framerate
+        self.last_effective_fps = effective_fps
+
+        raw_pulse = pos_algorithm(
+            window_rgb, effective_fps,
+            window_seconds=self.window_seconds,
+            combine_method=self.pos_combine,
+        )
+        pulse = bandpass_filter(raw_pulse, effective_fps, self.low_hz, self.high_hz)
+        hr, freqs, psd = estimate_heart_rate(
+            pulse, effective_fps, self.low_hz, self.high_hz, self.nsegments,
+        )
+        # ===== end unchanged algorithm calls =====
+
+        self.current_hr = hr
+        self.last_pulse_signal = pulse
+        self.last_psd = (freqs, psd)
+        self.hr_history.append(hr)
+
+        # ===== PERFORMANCE DIAGNOSTICS: §11/§12 exact window-block format =====
+        mode_slice = mode_snapshot[start_idx:end_idx]
+        reason_slice = reason_snapshot[start_idx:end_idx]
+        mediapipe_frames = sum(1 for m in mode_slice if m is True)
+        tracker_frames = n - mediapipe_frames
+        mp_pct = (mediapipe_frames / n * 100.0) if n else 0.0
+        tr_pct = (tracker_frames / n * 100.0) if n else 0.0
+        redetections = sum(1 for r in reason_slice if r not in (None, "INITIAL"))
+        failures = sum(1 for r in reason_slice
+                        if r in ("TRACKER_FAILURE", "GEOMETRY_REJECTED",
+                                  "NO_MASK_TEMPLATE", "TRACKER_INIT_FAILED"))
+
+        duration = window_end_seconds - window_start_seconds
+        deficit = effective_fps - self.framerate
+
+        if self.verbose:
+            print("=" * 60)
+            print(f"Window: {window_start_seconds:.1f} - {window_end_seconds:.1f} s")
+            print(f"Duration: {duration:.2f} s")
+            print(f"Samples: {n}")
+            print(f"Nominal FPS: {self.framerate:.2f}")
+            print(f"Actual FPS: {effective_fps:.2f}   (deficit: {deficit:+.2f})")
+            print(f"HR: {hr:.2f} BPM")
+            print(f"MediaPipe frames: {mediapipe_frames}")
+            print(f"{self.tracker_label} frames: {tracker_frames}")
+            print(f"MediaPipe usage: {mp_pct:.1f}%")
+            print(f"{self.tracker_label} usage: {tr_pct:.1f}%")
+            print(f"Re-detections: {redetections}")
+            print(f"Tracker failures: {failures}")
+            print("=" * 60)
+
+
+# =============================================================================
+# NEW / ===== KCF TRACKER CHANGE =====
+# Capture layer: camera opening (uncompressed YUYV via V4L2, unchanged
+# from before) and MediaPipe-detection + KCF-tracking ROI acquisition.
+#
+# Nothing below this point touches build_roi_mask(), mean_skin_rgb(),
+# pos_algorithm(), bandpass_filter(), or estimate_heart_rate().
+# =============================================================================
+
+# --- tracking failure / re-detect thresholds (adjust freely) ---------------
+TRACK_MAX_CENTER_JUMP_RATIO = 0.5
+TRACK_MIN_SIZE_RATIO = 0.4
+TRACK_MAX_SIZE_RATIO = 2.5
+# -----------------------------------------------------------------------
+
+
+def open_camera(camera_index, fourcc="YUYV", no_dshow=False, no_v4l2=False):
+    """Open a live camera requesting an UNCOMPRESSED pixel format (YUYV).
+    Frames are never encoded to MP4/H.264/H.265/MJPEG by this script;
+    they're processed directly as raw arrays from camera.read()."""
+    if sys.platform.startswith("linux") and not no_v4l2:
+        camera = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+    elif sys.platform.startswith("win") and not no_dshow:
+        camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    else:
+        camera = cv2.VideoCapture(camera_index)
+
+    if fourcc:
+        try:
+            camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+        except Exception as e:
+            print(f"WARNING: could not request FOURCC '{fourcc}' ({e}); "
+                  f"continuing with the camera's default format.")
+
+    return camera
+
+
+def print_negotiated_fourcc(camera, requested_fourcc):
+    """Never assume cap.set(CAP_PROP_FOURCC, ...) succeeded -- read back
+    and print what the driver actually negotiated."""
+    actual_code = int(camera.get(cv2.CAP_PROP_FOURCC))
+    actual_str = "".join(chr((actual_code >> (8 * i)) & 0xFF) for i in range(4))
+    w = camera.get(cv2.CAP_PROP_FRAME_WIDTH)
+    h = camera.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    match = "OK" if actual_str.upper().rstrip() == requested_fourcc.upper().rstrip() else "DIFFERENT"
+    print(f"Camera negotiated FOURCC='{actual_str}' at {w:.0f}x{h:.0f} "
+          f"(requested '{requested_fourcc}') [{match}]")
+    return actual_str
+
+
+# ===== KCF TRACKER CHANGE: §3 explicit availability check, never assumed =====
+_TRACKER_ATTR_NAMES = {
+    "KCF": "TrackerKCF_create",
+    "MOSSE": "TrackerMOSSE_create",
+}
+
+
+def check_tracker_availability(kind):
+    """Explicitly verify (not assume) that OpenCV has this tracker.
+    Returns (available: bool, api_name: str_or_None) -- api_name is e.g.
+    'cv2.TrackerKCF_create' or 'cv2.legacy.TrackerKCF_create'."""
+    attr = _TRACKER_ATTR_NAMES.get(kind.upper())
+    if attr is None:
+        return False, None
+    if hasattr(cv2, attr):
+        return True, f"cv2.{attr}"
+    legacy = getattr(cv2, "legacy", None)
+    if legacy is not None and hasattr(legacy, attr):
+        return True, f"cv2.legacy.{attr}"
+    return False, None
+
+
+def _create_cv_tracker(kind):
+    attr = _TRACKER_ATTR_NAMES.get(kind.upper())
+    if attr is None:
+        raise RuntimeError(f"Unknown tracker kind '{kind}' (use 'kcf' or 'mosse').")
+    for root in (cv2, getattr(cv2, "legacy", None)):
+        if root is None:
+            continue
+        ctor = getattr(root, attr, None)
+        if ctor is not None:
+            return ctor()
+    raise RuntimeError(
+        f"This OpenCV build has no {kind.upper()} tracker (cv2.{attr} / "
+        f"cv2.legacy.{attr} not found). KCF/MOSSE ship in "
+        f"opencv-contrib-python, not plain opencv-python -- try "
+        f"`pip install opencv-contrib-python` (uninstall opencv-python "
+        f"first if both are present)."
+    )
+
+
+class FaceROITracker:
+    """
+    MediaPipe is used only for the INITIAL detection and for RECOVERY
+    after a tracking failure. On every other frame, a lightweight
+    OpenCV tracker (KCF by default) follows the bounding box, and the
+    existing landmark-derived skin-exclusion mask -- built once, by the
+    unmodified build_roi_mask(), at the last real detection -- is
+    repositioned (resized) onto the tracker's new box. build_roi_mask()
+    and mean_skin_rgb() themselves are never touched.
+
+    ===== KCF TRACKER CHANGE =====
+    A runtime tracking failure (update()==False, geometric rejection,
+    or a failed re-init) NEVER permanently disables tracking -- it only
+    triggers one MediaPipe recovery frame, then tracking resumes (§5/§6).
+    The only thing that permanently disables tracking is a hard
+    capability check at construction time (KCF genuinely unavailable in
+    this OpenCV build), which is loud and explicit, never silent (§3).
+
+    process() returns (mask_or_None, bbox_or_None, used_mediapipe: bool,
+    reason: str_or_None) where reason is one of:
+        None                 -- normal tracker frame
+        "INITIAL"             -- the very first-ever detection
+        "TRACKER_FAILURE"     -- update() returned False
+        "GEOMETRY_REJECTED"   -- update() ok, but failed jump/size/bounds checks
+        "NO_MASK_TEMPLATE"    -- update()+geometry ok, but no template to resize (rare)
+        "TRACKER_INIT_FAILED" -- a fresh detection succeeded but tracker.init() raised
+        "NO_TRACKER_AVAILABLE" -- tracker permanently unavailable (§3 capability check failed)
+    """
+
+    def __init__(self, tracker_kind="kcf", max_gap=5, capability_checked=False):
+        self.tracker_kind = tracker_kind
+        self.max_gap = max_gap
+        self.cv_tracker = None
+        self.last_detect_bbox = None
+        self.last_full_mask = None
+        self.gap_count = 0
+
+        # ===== PERFORMANCE DIAGNOSTICS counters =====
+        self.redetect_count = 0          # MediaPipe calls after the very first
+        self.tracker_failure_count = 0   # times an ACTIVE tracker specifically failed
+        self.recovery_success_count = 0  # redetects that successfully reinit'd a tracker
+        self.mediapipe_frame_count = 0   # cumulative, every frame
+        self.tracker_frame_count = 0     # cumulative, every frame
+
+        self._warned_no_tracker = False
+
+    def _make_tracker(self):
+        if self.tracker_kind is None:
+            return None
+        try:
+            return _create_cv_tracker(self.tracker_kind)
+        except RuntimeError as e:
+            if not self._warned_no_tracker:
+                print(f"WARNING: {e}\nDisabling tracking -- MediaPipe will "
+                      f"run on every frame instead.")
+                self._warned_no_tracker = True
+            self.tracker_kind = None
+            return None
+
+    @staticmethod
+    def _bbox_in_bounds(bbox, frame_shape):
+        bx, by, bw, bh = bbox
+        h, w = frame_shape[:2]
+        return bw > 0 and bh > 0 and bx >= 0 and by >= 0 and bx + bw <= w and by + bh <= h
+
+    def _tracking_ok(self, new_bbox, frame_shape):
+        if not self._bbox_in_bounds(new_bbox, frame_shape):
+            return False
+        if self.last_detect_bbox is None:
+            return True
+        ox, oy, ow, oh = self.last_detect_bbox
+        nx, ny, nw, nh = new_bbox
+        if ow <= 0 or oh <= 0:
+            return False
+        old_center = (ox + ow / 2.0, oy + oh / 2.0)
+        new_center = (nx + nw / 2.0, ny + nh / 2.0)
+        dist = ((old_center[0] - new_center[0]) ** 2 + (old_center[1] - new_center[1]) ** 2) ** 0.5
+        if dist > TRACK_MAX_CENTER_JUMP_RATIO * max(ow, oh):
+            return False
+        ratio = (nw * nh) / (ow * oh)
+        if ratio < TRACK_MIN_SIZE_RATIO or ratio > TRACK_MAX_SIZE_RATIO:
+            return False
+        return True
+
+    def _mask_for_bbox(self, bbox, frame_shape):
+        h, w = frame_shape[:2]
+        bx, by, bw, bh = [int(round(v)) for v in bbox]
+        if self.last_full_mask is None or self.last_detect_bbox is None:
+            return None
+        ox, oy, ow, oh = self.last_detect_bbox
+        template = self.last_full_mask[oy:oy + oh, ox:ox + ow]
+        if template.size == 0 or bw <= 0 or bh <= 0:
+            return None
+        resized = cv2.resize(template, (bw, bh), interpolation=cv2.INTER_NEAREST)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        mask[by:by + bh, bx:bx + bw] = resized
+        return mask
+
+    def _run_detection(self, frame, landmarker, timestamp_ms, reason):
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+        was_redetect = reason != "INITIAL"
+
+        if not result.face_landmarks:
+            self.gap_count += 1
+            self.mediapipe_frame_count += 1
+            if self.last_full_mask is not None and self.gap_count <= self.max_gap:
+                return self.last_full_mask, self.last_detect_bbox, True, reason
+            return None, None, True, reason
+
+        landmarks_px = landmarks_to_pixels(result.face_landmarks[0], frame.shape)
+        mask, bbox = build_roi_mask(frame.shape, landmarks_px)  # UNCHANGED
+
+        if was_redetect:
+            self.redetect_count += 1
+        self.last_full_mask = mask
+        self.last_detect_bbox = bbox
+        self.gap_count = 0
+        self.mediapipe_frame_count += 1
+
+        self.cv_tracker = self._make_tracker()
+        if self.cv_tracker is not None:
+            try:
+                self.cv_tracker.init(frame, tuple(int(v) for v in bbox))
+                if was_redetect:
+                    self.recovery_success_count += 1
+            except Exception as e:
+                print(f"WARNING: tracker.init() failed ({e}); will retry "
+                      f"detection next frame.")
+                self.cv_tracker = None
+
+        return mask, bbox, True, reason
+
+    def process(self, frame, landmarker, timestamp_ms):
+        if self.cv_tracker is None:
+            if self.last_detect_bbox is None:
+                reason = "INITIAL"
+            elif self.tracker_kind is None:
+                reason = "NO_TRACKER_AVAILABLE"
+            else:
+                reason = "TRACKER_INIT_FAILED"
+            return self._run_detection(frame, landmarker, timestamp_ms, reason)
+
+        try:
+            ok, raw_bbox = self.cv_tracker.update(frame)
+        except Exception as e:
+            if not self._warned_no_tracker:
+                print(f"WARNING: tracker.update() raised {e!r}; treating as "
+                      f"a tracking failure (this frame only -- tracking "
+                      f"will retry after MediaPipe recovers).")
+            ok, raw_bbox = False, None
+
+        if not ok:
+            self.tracker_failure_count += 1
+            self.cv_tracker = None
+            return self._run_detection(frame, landmarker, timestamp_ms, "TRACKER_FAILURE")
+
+        if not self._tracking_ok(tuple(raw_bbox), frame.shape):
+            self.tracker_failure_count += 1
+            self.cv_tracker = None
+            return self._run_detection(frame, landmarker, timestamp_ms, "GEOMETRY_REJECTED")
+
+        bbox = tuple(int(round(v)) for v in raw_bbox)
+        mask = self._mask_for_bbox(bbox, frame.shape)
+        if mask is None:
+            self.tracker_failure_count += 1
+            self.cv_tracker = None
+            return self._run_detection(frame, landmarker, timestamp_ms, "NO_MASK_TEMPLATE")
+
+        self.tracker_frame_count += 1
+        return mask, bbox, False, None
+
+
+def process_single_frame(frame, roi_tracker, landmarker, timestamp_ms,
+                          use_color_skin_mask=True, image_show=False):
+    """Per-frame ROI acquisition (via roi_tracker) followed by the
+    UNCHANGED mean_skin_rgb() call.
+
+    Returns (rgb_or_None, used_mediapipe: bool, reason: str_or_None).
+    """
+    mask, bbox, used_mediapipe, reason = roi_tracker.process(frame, landmarker, timestamp_ms)
+
+    rgb = None
+    if mask is not None and bbox is not None:
+        bx, by, bw, bh = bbox
+        if bw > 0 and bh > 0:
+            face_crop = frame[by:by + bh, bx:bx + bw]
+            mask_crop = mask[by:by + bh, bx:bx + bw]
+            if face_crop.size > 0:
+                rgb = mean_skin_rgb(face_crop, mask_crop, use_color_skin_mask)  # UNCHANGED
+            if image_show:
+                color = (0, 255, 0) if used_mediapipe else (255, 200, 0)
+                cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), color, 2)
+
+    return rgb, used_mediapipe, reason
+
+
+def _gui_available():
+    try:
+        cv2.namedWindow("__gui_probe__", cv2.WINDOW_NORMAL)
+        cv2.destroyWindow("__gui_probe__")
+        return True
+    except cv2.error:
+        return False
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-v", "--video",
+                     help="optional video file to stream instead of a live "
+                          "camera (paced to real time via sleep)")
+    ap.add_argument("--camera_index", type=int, default=0,
+                     help="camera device index to use when --video is not given")
+    ap.add_argument("--framerate", type=float, default=30.0,
+                     help="nominal capture framerate; fallback only -- real "
+                          "elapsed time is what actually drives the HR math")
+    ap.add_argument("--face_model", default="face_landmarker.task")
+    ap.add_argument("--no_color_skin_mask", action="store_true")
+    ap.add_argument("--window_seconds", type=float, default=1.6,
+                     help="POS sliding-window length in seconds (paper default 1.6s)")
+    ap.add_argument("--pos_combine", choices=["alpha", "svd"], default="alpha")
+    ap.add_argument("--low_hz", type=float, default=0.7)
+    ap.add_argument("--high_hz", type=float, default=3.5)
+    ap.add_argument("--max_gap", type=int, default=5,
+                     help="max consecutive frames with no usable ROI before "
+                          "giving up on reusing the last known ROI")
+    ap.add_argument("--nsegments", type=int, default=12)
+    ap.add_argument("--start_display_at", type=float, default=11.0,
+                     help="second at which the first HR value is computed/shown")
+    ap.add_argument("--buffer_seconds", type=float, default=10.0,
+                     help="width of the rolling window in seconds (default 10s)")
+    ap.add_argument("--image_show", action="store_true",
+                     help="show a live window with the camera feed and HR overlay")
+    ap.add_argument("--fourcc", default="YUYV",
+                     help="pixel format to request from the camera (default "
+                          "YUYV, uncompressed). Pass '' to leave the "
+                          "camera's default untouched.")
+    ap.add_argument("--no_dshow", action="store_true",
+                     help="on Windows, don't force the DirectShow backend")
+    ap.add_argument("--no_v4l2", action="store_true",
+                     help="on Linux, don't force the V4L2 backend")
+    # ===== KCF TRACKER CHANGE: KCF is now the default =====
+    ap.add_argument("--tracker", choices=["kcf", "mosse", "none"], default="kcf",
+                     help="lightweight tracker used between MediaPipe "
+                          "detections. Default is now KCF. 'none' disables "
+                          "tracking and runs MediaPipe on every frame.")
+    ap.add_argument("--verbose_frames", action="store_true",
+                     help="print a diagnostic line for every single frame "
+                          "(frame number, elapsed time, fps, mode, and, on "
+                          "re-detect frames, the reason + recovery result). "
+                          "Off by default -- the per-10s-window block below "
+                          "is the primary output.")
+    args = ap.parse_args()
+
+    if args.video:
+        camera = cv2.VideoCapture(1)
+        is_file = True
+    else:
+        camera = open_camera(1, fourcc=args.fourcc,
+                              no_dshow=args.no_dshow, no_v4l2=args.no_v4l2)
+        is_file = False
+    if not camera.isOpened():
+        raise RuntimeError("Cannot open video source.")
+
+    if not is_file:
+        print_negotiated_fourcc(camera, args.fourcc)
+    else:
+        # ===== §19 video-file behavior: don't confuse video FPS with
+        # actual processing FPS -- state the pacing explicitly. =====
+        print(f"Processing video file '{args.video}', paced to real time via "
+              f"sleep so the same 1s-per-window HR schedule applies as a "
+              f"live camera would get. --framerate is only the pacing "
+              f"target; actual FPS used for the HR math is measured from "
+              f"real timestamps, same as with a live camera.")
+
+    model_path = ensure_face_landmarker_model(args.face_model)
+    landmarker = build_face_landmarker(model_path)
+
+    # ===== KCF TRACKER CHANGE: §3 explicit capability check, printed loudly =====
+    tracker_kind = None if args.tracker == "none" else args.tracker
+    if tracker_kind is not None:
+        available, api_name = check_tracker_availability(tracker_kind)
+        print(f"OpenCV version: {cv2.__version__}")
+        print(f"{tracker_kind.upper()} available: {'YES' if available else 'NO'}")
+        if available:
+            print(f"{tracker_kind.upper()} API: {api_name}")
+        else:
+            print("!" * 60)
+            print(f"ERROR: opencv-contrib tracker module not found for "
+                  f"{tracker_kind.upper()} (checked cv2.{_TRACKER_ATTR_NAMES[tracker_kind.upper()]} "
+                  f"and cv2.legacy.{_TRACKER_ATTR_NAMES[tracker_kind.upper()]}).")
+            print("Install with: pip install opencv-contrib-python")
+            print("(uninstall plain opencv-python first if both are present)")
+            print(f"Continuing WITHOUT tracking -- MediaPipe will run on "
+                  f"every frame (slower, but still correct).")
+            print("!" * 60)
+            tracker_kind = None
+
+    tracker_label = tracker_kind.upper() if tracker_kind else "NONE"
+    print(f"Tracker: {tracker_label}")
+
+    roi_tracker = FaceROITracker(tracker_kind=tracker_kind, max_gap=args.max_gap)
+
+    monitor = RealTimeHeartRateMonitor(
+        framerate=args.framerate,
+        start_display_at=args.start_display_at,
+        buffer_seconds=args.buffer_seconds,
+        window_seconds=args.window_seconds,
+        pos_combine=args.pos_combine,
+        low_hz=args.low_hz,
+        high_hz=args.high_hz,
+        nsegments=args.nsegments,
+        tracker_label=tracker_label,
+    )
+
+    last_timestamp_ms = -1
+    frame_number = 0
+    frame_interval = 1.0 / args.framerate
+    recent_frame_times = []
+    FPS_WINDOW = 15
+
+    image_show = args.image_show
+    if image_show and not _gui_available():
+        print("WARNING: --image_show was requested but this OpenCV build "
+              "has no GUI backend. Falling back to console-only output.")
+        image_show = False
+
+    print(f"Streaming... collecting baseline for {args.start_display_at:.0f}s "
+          f"before the first HR estimate is shown.")
+
+    monitor.start()
+    try:
+        while True:
+            loop_start = time.time()
+
+            grabbed, frame = camera.read()
+            if not grabbed:
+                print("End of stream / camera read failed.")
+                break
+
+            timestamp_ms = int(round((time.time() - monitor.start_time) * 1000.0))
+            if timestamp_ms <= last_timestamp_ms:
+                timestamp_ms = last_timestamp_ms + 1
+            last_timestamp_ms = timestamp_ms
+
+            rgb, used_mediapipe, reason = process_single_frame(
+                frame, roi_tracker, landmarker, timestamp_ms,
+                use_color_skin_mask=not args.no_color_skin_mask,
+                image_show=image_show,
+            )
+
+            if rgb is None:
+                if monitor.n_samples() > 0:
+                    with monitor._lock:
+                        rgb = tuple(monitor._trace[-1])
+
+            if rgb is not None:
+                monitor.append_sample(rgb, used_mediapipe=used_mediapipe, reason=reason)
+
+            frame_number += 1
+            recent_frame_times.append(loop_start)
+            if len(recent_frame_times) > FPS_WINDOW:
+                recent_frame_times.pop(0)
+            if len(recent_frame_times) >= 2:
+                span = recent_frame_times[-1] - recent_frame_times[0]
+                current_fps = (len(recent_frame_times) - 1) / span if span > 1e-6 else 0.0
+            else:
+                current_fps = 0.0
+
+            # ===== PERFORMANCE DIAGNOSTICS: §10 per-frame verbose format =====
+            mode_str = "MEDIAPIPE" if used_mediapipe else roi_tracker.tracker_kind.upper() if roi_tracker.tracker_kind else "MEDIAPIPE"
+            if args.verbose_frames:
+                elapsed_total = time.time() - monitor.start_time
+                print(f"frame={frame_number:<6d} time={elapsed_total:6.2f}s   "
+                      f"fps={current_fps:5.1f}   mode={mode_str}")
+                if reason not in (None, "INITIAL"):
+                    recovered = roi_tracker.cv_tracker is not None
+                    print(f"          reason={reason}  "
+                          f"recovery={'SUCCESS' if recovered else 'FAILED'}")
+
+            if image_show:
+                elapsed = time.time() - monitor.start_time
+                if monitor.current_hr is not None:
+                    label = f"HR: {monitor.current_hr:.1f} bpm  [{mode_str}]"
+                    color = (0, 255, 0)
+                else:
+                    remaining = max(0.0, args.start_display_at - elapsed)
+                    label = f"Collecting baseline... {remaining:.1f}s  [{mode_str}]"
+                    color = (0, 165, 255)
+                cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.9, color, 2, cv2.LINE_AA)
+                try:
+                    cv2.imshow("Real-time rPPG", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                except cv2.error as e:
+                    print(f"WARNING: display window failed ({e}); "
+                          f"continuing in console-only mode.")
+                    image_show = False
+
+            if is_file:
+                elapsed_loop = time.time() - loop_start
+                sleep_left = frame_interval - elapsed_loop
+                if sleep_left > 0:
+                    time.sleep(sleep_left)
+    except KeyboardInterrupt:
+        print("Interrupted by user.")
+    finally:
+        monitor.stop()
+        camera.release()
+        landmarker.close()
+        if image_show:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
+
+    # ===== PERFORMANCE DIAGNOSTICS: §15 final performance summary =====
+    total_duration = (time.time() - monitor.start_time) if monitor.start_time else 0.0
+    avg_actual_fps = frame_number / total_duration if total_duration > 1e-6 else 0.0
+    mp_total = roi_tracker.mediapipe_frame_count
+    tr_total = roi_tracker.tracker_frame_count
+    total_for_pct = mp_total + tr_total
+    mp_pct = (mp_total / total_for_pct * 100.0) if total_for_pct else 0.0
+    tr_pct = (tr_total / total_for_pct * 100.0) if total_for_pct else 0.0
+    avg_hr = statistics.mean(monitor.hr_history) if monitor.hr_history else None
+
+    print("================= FINAL PERFORMANCE =================")
+    print(f"Total frames:               {frame_number}")
+    print(f"Total duration:             {total_duration:.2f} s")
+    print(f"Average actual FPS:         {avg_actual_fps:.2f}")
+    print(f"Nominal FPS:                {args.framerate:.2f}")
+    print()
+    print(f"MediaPipe frames:           {mp_total}")
+    print(f"{tracker_label} frames:           {tr_total}")
+    print()
+    print(f"MediaPipe usage:            {mp_pct:.1f} %")
+    print(f"{tracker_label} usage:            {tr_pct:.1f} %")
+    print()
+    print(f"Tracker failures:           {roi_tracker.tracker_failure_count}")
+    print(f"Successful recoveries:      {roi_tracker.recovery_success_count}")
+    print()
+    print(f"Average HR:                 "
+          f"{avg_hr:.2f} BPM" if avg_hr is not None else "Average HR:                 n/a")
+    print("=======================================================")
+
+    if monitor.current_hr is not None:
+        print(f"Final displayed heart rate: {monitor.current_hr:.2f} bpm")
+    else:
+        print("Stream ended before the first HR estimate could be computed "
+              f"(needs >= {args.start_display_at:.0f}s of footage with a "
+              "detected face).")
+
+
+if __name__ == "__main__":
+    main()
