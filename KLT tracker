@@ -1,0 +1,1198 @@
+"""
+Real-time pulse extraction using the POS algorithm.
+
+pos_algorithm(), bandpass_filter(), estimate_heart_rate(), and all of the
+MediaPipe-based face/skin ROI extraction (landmarks_to_pixels,
+build_roi_mask, mean_skin_rgb, build_face_landmarker,
+ensure_face_landmarker_model) are copied VERBATIM and never touched by
+any of the tracker/diagnostics work below.
+
+# ===== KLT TRACKER CHANGE =====
+The KCF tracker has been removed entirely and replaced with a KLT
+(Lucas-Kanade pyramidal optical flow, cv2.calcOpticalFlowPyrLK) tracker.
+The tracker/orchestration layer (FaceROITracker) now also:
+  - uses MediaPipe only for the INITIAL detection and for RECOVERY after
+    a tracking failure, exactly as before -- only the mechanism used
+    *between* those detections has changed (KLT feature tracking instead
+    of a cv2 correlation tracker),
+  - selects a set of good-to-track corner features (cv2.goodFeaturesToTrack)
+    inside the last known skin/landmark mask at every (re)detection, then
+    advances those points frame-to-frame with calcOpticalFlowPyrLK,
+  - estimates the new ROI bounding box each frame from the tracked
+    points' median translation and mean-radial scale change relative to
+    the previous frame's points/bbox,
+  - labels every re-detection with the same reason codes as before
+    (§10) so "tracker never engages" (too few trackable features at
+    init) can be told apart from "tracking degrades mid-flight" (too
+    few surviving points) from "tracking succeeds but the estimated box
+    is geometrically rejected"; NO_TRACKER_AVAILABLE now simply means
+    "--tracker none was requested, so MediaPipe runs every frame",
+  - never permanently disables itself after a single runtime failure
+    (only when --tracker none is explicitly requested does it always
+    run MediaPipe) (§5/§6).
+KLT ships in core opencv-python (cv2.calcOpticalFlowPyrLK /
+cv2.goodFeaturesToTrack are not contrib-only), so the
+opencv-contrib-python dependency that KCF/MOSSE needed is gone.
+# ===== PERFORMANCE DIAGNOSTICS =====
+The per-second HR summary still prints the full 10-second-window block
+format requested (MediaPipe/KLT frame counts, usage %, re-detections,
+tracker failures, capture-vs-nominal FPS), and a final end-of-run
+performance summary is printed on exit. All of this is diagnostic
+printing layered around the exact same unmodified pos_algorithm /
+bandpass_filter / estimate_heart_rate calls as before -- the actual
+HR math is untouched.
+
+Requires: pip install mediapipe opencv-python scipy numpy
+"""
+
+import os
+import sys
+import time
+import bisect
+import threading
+import argparse
+import statistics
+import urllib.request
+
+import numpy as np
+import cv2
+from scipy.signal import welch, butter, filtfilt
+
+import mediapipe as mp
+from mediapipe.tasks.python.core.base_options import BaseOptions
+from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
+    VisionTaskRunningMode,
+)
+from mediapipe.tasks.python.vision.face_landmarker import (
+    FaceLandmarker,
+    FaceLandmarkerOptions,
+    FaceLandmarksConnections,
+)
+
+sys.path.insert(0, "./SkinDetector")
+import skin_detector  # noqa: E402
+
+FACE_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+
+
+def ensure_face_landmarker_model(model_path):
+    if os.path.exists(model_path):
+        return model_path
+    print(f"Downloading Face Landmarker model to {model_path} ...")
+    try:
+        urllib.request.urlretrieve(FACE_LANDMARKER_MODEL_URL, model_path)
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not download {FACE_LANDMARKER_MODEL_URL} ({e}). "
+            f"If this network is blocked, download the file manually from "
+            f"that URL and pass its path via --face_model."
+        )
+    return model_path
+
+
+def build_face_landmarker(model_path):
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionTaskRunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return FaceLandmarker.create_from_options(options)
+
+
+def _connection_indices(connections):
+    idx = set()
+    for c in connections:
+        idx.add(c.start)
+        idx.add(c.end)
+    return sorted(idx)
+
+
+_FACE_OVAL_IDX = _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_FACE_OVAL)
+_EXCLUDE_IDX_GROUPS = [
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYE),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYE),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYEBROW),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYEBROW),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LIPS),
+]
+
+
+def _dilate_hull(hull_pts, pad_ratio):
+    pts = hull_pts.reshape(-1, 2).astype(np.float32)
+    centroid = pts.mean(axis=0)
+    pts = centroid + (pts - centroid) * (1.0 + pad_ratio)
+    return pts.astype(np.int32).reshape(-1, 1, 2)
+
+
+def landmarks_to_pixels(face_landmarks, frame_shape):
+    h, w = frame_shape[:2]
+    pts = np.array([[lm.x * w, lm.y * h] for lm in face_landmarks], dtype=np.float32)
+    return pts
+
+
+def build_roi_mask(frame_shape, landmarks_px):
+    h, w = frame_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+
+    oval_pts = landmarks_px[_FACE_OVAL_IDX].astype(np.int32)
+    oval_hull = cv2.convexHull(oval_pts)
+    cv2.fillConvexPoly(mask, oval_hull, 255)
+
+    for group_idx in _EXCLUDE_IDX_GROUPS:
+        pts = landmarks_px[group_idx].astype(np.int32)
+        hull = cv2.convexHull(pts)
+        hull = _dilate_hull(hull, pad_ratio=0.35)
+        cv2.fillConvexPoly(mask, hull, 0)
+
+    return mask, cv2.boundingRect(oval_hull)  # (x, y, w, h)
+
+
+# ===== KLT TRACKER CHANGE: separate, wider mask for feature *tracking* only.
+# build_roi_mask() above (used for skin-color averaging) deliberately
+# excludes eyes/eyebrows/lips so those non-skin colors don't pollute the
+# rPPG signal -- but that leaves only flat, low-texture cheek/forehead
+# skin for goodFeaturesToTrack to pick from, which tracks poorly. Eyes,
+# eyebrows, lips, and nose are excellent high-texture KLT features even
+# though their COLOR shouldn't be averaged into the pulse signal, so this
+# additive helper builds a wider mask (just the face-oval hull, no
+# exclusions) used ONLY to seed tracking points. build_roi_mask() itself
+# is untouched. =====
+def build_tracking_mask(frame_shape, landmarks_px):
+    h, w = frame_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    oval_pts = landmarks_px[_FACE_OVAL_IDX].astype(np.int32)
+    oval_hull = cv2.convexHull(oval_pts)
+    cv2.fillConvexPoly(mask, oval_hull, 255)
+    return mask
+
+
+def mean_skin_rgb(frame_bgr, landmark_mask, use_color_skin_mask=True):
+    mask = landmark_mask
+    if use_color_skin_mask:
+        color_mask = skin_detector.process(frame_bgr)
+        mask = cv2.bitwise_and(mask, color_mask)
+
+    masked_face = cv2.bitwise_and(frame_bgr, frame_bgr, mask=mask)
+    n_skin = int(np.sum(mask > 0))
+    if n_skin == 0:
+        return None
+    r = np.sum(masked_face[:, :, 2]) / n_skin
+    g = np.sum(masked_face[:, :, 1]) / n_skin
+    b = np.sum(masked_face[:, :, 0]) / n_skin
+    return r, g, b
+
+
+def pos_algorithm(mean_rgb, framerate, window_seconds=1.6, eps=1e-9, combine_method="alpha"):
+    n = mean_rgb.shape[0]
+    l = int(round(framerate * window_seconds))
+    l = max(l, 2)
+
+    H = np.zeros(n)
+    projection_matrix = np.array([[0, 1, -1], [-2, 1, 1]])
+    identity_2x2 = np.eye(2)
+
+    for t in range(0, n - l + 1):
+        C = mean_rgb[t:t + l, :].T  # (3, l)
+
+        mean_color = np.mean(C, axis=1)
+        mean_color = np.where(np.abs(mean_color) < eps, eps, mean_color)
+        diag_mean_color_inv = np.diag(1.0 / mean_color)
+
+        Cn = diag_mean_color_inv @ C
+        S = projection_matrix @ Cn  # (2, l)
+
+        if combine_method == "svd":
+            try:
+                U, _sing, _Vt = np.linalg.svd(S, full_matrices=False)
+            except np.linalg.LinAlgError:
+                continue
+            q1 = U[:, 0]
+            proj = identity_2x2 - np.outer(q1, q1)
+            u = proj @ S
+            P = u[0, :]
+        else:  # "alpha" (default, original POS)
+            std0 = np.std(S[0, :])
+            std1 = np.std(S[1, :])
+            alpha = std0 / std1 if std1 > eps else 0.0
+            std_vec = np.array([1.0, alpha])
+            P = std_vec @ S
+
+        p_std = np.std(P)
+        if p_std < eps:
+            continue
+        H[t:t + l] += (P - np.mean(P)) / p_std
+
+    return H
+
+
+def bandpass_filter(signal, framerate, low_hz=0.7, high_hz=3.5, order=3):
+    nyq = framerate / 2.0
+    low = max(low_hz / nyq, 1e-4)
+    high = min(high_hz / nyq, 0.999)
+    b, a = butter(order, [low, high], btype="bandpass")
+    padlen = 3 * max(len(a), len(b))
+    if len(signal) <= padlen:
+        padlen = max(len(signal) - 1, 0)
+    return filtfilt(b, a, signal, padlen=padlen)
+
+
+def estimate_heart_rate(signal, framerate, low_hz=0.7, high_hz=3.5, nsegments=12,
+                         freq_resolution_hz=0.01):
+    segment_length = (2 * signal.shape[0]) // (nsegments + 1)
+    segment_length = max(segment_length, 8)
+    segment_length = min(segment_length, signal.shape[0])
+
+    nfft = 1
+    target = int(framerate / freq_resolution_hz)
+    while nfft < max(segment_length, target):
+        nfft *= 2
+
+    f, psd = welch(signal, framerate, window="hamming",
+                    nperseg=segment_length, nfft=nfft)
+
+    band = np.where((f >= low_hz) & (f <= high_hz))[0]
+    if band.size == 0:
+        raise RuntimeError("No frequency bins fall inside the requested HR band.")
+
+    max_idx = np.argmax(psd[band])
+    f_max = f[band[max_idx]]
+    hr = f_max * 60.0
+    return hr, f, psd
+
+
+# =============================================================================
+# NEW: SNR calculation. This is a separate, additive function -- it does
+# NOT modify estimate_heart_rate() or anything it calls. It consumes
+# exactly the (freqs, psd) that estimate_heart_rate() already returns
+# (the Welch PSD of the actual band-passed rPPG pulse signal, i.e. the
+# same "signal"/"pulse" that produced the HR value -- never the raw RGB
+# trace), plus the HR value estimate_heart_rate() already computed from
+# that same PSD, so no frequency analysis is duplicated or redone
+# differently.
+#
+# Matches the canonical rPPG SNR definition used in the literature (de
+# Haan & Jeanne 2013 "Robust Pulse-rate From Chrominance-based rPPG";
+# Poh et al. 2010; and the formulation referenced in PMC5480591):
+#     SNR = 10*log10( power around the pulse frequency (+ harmonic)
+#                     / remaining power within the physiological HR band )
+# NOT "cardiac power / all raw reflected-light power" -- the denominator
+# was already restricted to the physiological band below (see
+# physio_mask), never the full unrestricted Welch spectrum. The two
+# defaults changed to match that literature convention explicitly:
+# include_harmonic now defaults to True (the classic formula treats the
+# fundamental AND first harmonic as "signal" by default, not as an
+# opt-in extra), and signal_band_hz defaults to 0.2 Hz (the standard
+# half-bandwidth used in that formulation, was 0.1 Hz before).
+# =============================================================================
+
+def calculate_snr(freqs, psd, hr_bpm, low_hz=0.7, high_hz=3.5,
+                   signal_band_hz=0.2, include_harmonic=True):
+    """
+    SNR (dB) of the rPPG pulse signal, using the estimated HR only to
+    locate WHERE the expected pulse frequency sits -- HR itself is never
+    used as a power/amplitude value. The actual power numbers come
+    entirely from the PSD bins (the real Welch spectrum of the pulse
+    signal), which is what "signal power" and "noise power" are measured
+    from below.
+
+    Definitions (canonical rPPG SNR, e.g. de Haan & Jeanne 2013):
+      - target_hz = HR_bpm / 60           -- expected pulse frequency location
+      - signal band:  [target_hz - signal_band_hz, target_hz + signal_band_hz]
+                       UNION a matching band around the 2nd harmonic,
+                       2*target_hz, when include_harmonic=True (the
+                       default) and that harmonic falls inside
+                       [low_hz, high_hz] -- both fundamental and first
+                       harmonic count as "signal" in the standard formula.
+      - noise band:   [low_hz, high_hz] MINUS the signal band(s) above
+                       -- i.e. every OTHER frequency component that's
+                       still physiologically plausible (within the same
+                       band the HR search itself was restricted to), but
+                       isn't where the detected pulse (or its harmonic)
+                       sits. This is deliberately NOT the full 0-to-Nyquist
+                       Welch spectrum -- energy outside [low_hz, high_hz]
+                       (e.g. very low-frequency drift, high-frequency
+                       motion noise) is excluded from both signal and
+                       noise, matching "remaining power in the selected
+                       HR band," not "all raw reflected-light power."
+
+    Signal power = sum of PSD magnitude in the signal band(s).
+    Noise power  = sum of PSD magnitude in the remaining physiological
+                   band, excluding the signal band(s).
+    SNR_dB = 10 * log10(signal_power / noise_power).
+
+    Returns (snr_db_or_None, target_hz). snr_db is None if there isn't
+    enough spectrum to compute a meaningful ratio (e.g. noise_power == 0).
+    """
+    target_hz = hr_bpm / 60.0
+
+    # The full physiologically-plausible band we're allowed to look at --
+    # same [low_hz, high_hz] the HR search itself was restricted to. Both
+    # signal_mask and noise_mask below are ANDed with this, so neither
+    # one ever includes energy from outside the HR band -- the "remaining
+    # power in the selected HR band" denominator from the literature
+    # formula, not the unrestricted raw spectrum.
+    physio_mask = (freqs >= low_hz) & (freqs <= high_hz)
+
+    # --- signal band: real PSD power around the detected pulse frequency ---
+    signal_mask = physio_mask & (freqs >= target_hz - signal_band_hz) & \
+                  (freqs <= target_hz + signal_band_hz)
+
+    if include_harmonic:
+        harmonic_hz = 2.0 * target_hz
+        if low_hz <= harmonic_hz <= high_hz:
+            harmonic_mask = physio_mask & (freqs >= harmonic_hz - signal_band_hz) & \
+                             (freqs <= harmonic_hz + signal_band_hz)
+            signal_mask = signal_mask | harmonic_mask
+
+    # --- noise band: everything else inside the physiological band ---
+    # (physio_mask here is what keeps this "remaining power in the
+    # selected HR band" rather than "all raw reflected-light power.")
+    noise_mask = physio_mask & ~signal_mask
+
+    # Sum (not mean) of PSD bins in each band = total power in that band --
+    # this is the actual sampled spectrum's energy, not a derived/assumed
+    # value, and HR does not appear anywhere in these two sums except as
+    # the band boundary that was used to select which bins belong where.
+    signal_power = float(np.sum(psd[signal_mask])) if np.any(signal_mask) else 0.0
+    noise_power = float(np.sum(psd[noise_mask])) if np.any(noise_mask) else 0.0
+
+    if signal_power <= 0.0 or noise_power <= 0.0:
+        return None, target_hz
+
+    snr_db = 10.0 * np.log10(signal_power / noise_power)
+    return snr_db, target_hz
+# ===== PERFORMANCE DIAGNOSTICS =====
+# Added: a parallel per-sample mode/reason log (which frames in this
+# window were MediaPipe vs tracker, and why any re-detections happened),
+# so the window summary can report the exact §11/§12 format. This never
+# feeds into the HR math -- it's read-only bookkeeping alongside the
+# already-existing rgb/timestamp trace.
+# =============================================================================
+
+class RealTimeHeartRateMonitor:
+    """
+    Owns the growing mean-RGB trace and a background thread that, once a
+    second, runs the (unmodified) POS -> band-pass -> HR-estimation
+    pipeline on the samples collected so far and updates `current_hr`.
+
+    `framerate` is only a *fallback/nominal* value. Frames are
+    timestamped with the real wall-clock time they were captured at, and
+    windows are selected by real elapsed time. The *actual* achieved
+    sample rate within each window is what gets passed to
+    pos_algorithm/bandpass_filter/estimate_heart_rate.
+
+    Fixed-width rolling buffer of length `buffer_seconds` (default 10s),
+    sliding by 1s every second, starting at `start_display_at`.
+    """
+
+    def __init__(self, framerate, start_display_at=11, buffer_seconds=10.0,
+                 window_seconds=1.6, pos_combine="alpha", low_hz=0.7,
+                 high_hz=3.5, nsegments=12, verbose=True, tracker_label="KLT",
+                 snr_band_hz=0.2, snr_include_harmonic=True):
+        self.framerate = framerate  # nominal fallback only, see class docstring
+        self.start_display_at = start_display_at
+        self.buffer_seconds = buffer_seconds
+        self.window_seconds = window_seconds
+        self.pos_combine = pos_combine
+        self.low_hz = low_hz
+        self.high_hz = high_hz
+        self.nsegments = nsegments
+        self.verbose = verbose
+        self.tracker_label = tracker_label  # display label only, e.g. "KLT"/"NONE"
+        self.snr_band_hz = snr_band_hz              # NEW: SNR signal-band half-width (Hz)
+        self.snr_include_harmonic = snr_include_harmonic  # NEW: include 2nd-harmonic band
+
+        self._trace = []       # rolling list of [r, g, b] rows
+        self._timestamps = []  # parallel: seconds since start_time for each row
+        self._mode_log = []    # parallel: True=MediaPipe frame, False=tracker frame
+        self._reason_log = []  # parallel: None, "INITIAL", or a failure-reason code
+        self._total_appended = 0
+        self._keep_seconds = buffer_seconds + 2.0
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+
+        self.start_time = None
+        self.current_hr = None
+        self.last_pulse_signal = None
+        self.last_psd = None
+        self.last_effective_fps = None
+        self.last_snr_db = None        # NEW: most recent SNR (None if not computable)
+        self.last_target_hz = None     # NEW: HR converted to Hz, for display
+        self.hr_history = []   # every HR value ever computed, for the final summary
+        self.snr_history = []  # every computable SNR value, for the final summary
+
+    def append_sample(self, rgb, timestamp_seconds=None, used_mediapipe=None, reason=None):
+        with self._lock:
+            if timestamp_seconds is None:
+                timestamp_seconds = (time.time() - self.start_time) if self.start_time else 0.0
+            self._trace.append(list(rgb))
+            self._timestamps.append(timestamp_seconds)
+            self._mode_log.append(used_mediapipe)
+            self._reason_log.append(reason)
+            self._total_appended += 1
+
+            cutoff = timestamp_seconds - self._keep_seconds
+            n_drop = bisect.bisect_left(self._timestamps, cutoff)
+            if n_drop > 0:
+                del self._trace[:n_drop]
+                del self._timestamps[:n_drop]
+                del self._mode_log[:n_drop]
+                del self._reason_log[:n_drop]
+
+    def n_samples(self):
+        with self._lock:
+            return self._total_appended
+
+    def start(self):
+        self.start_time = time.time()
+        self._thread = threading.Thread(target=self._estimation_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _estimation_loop(self):
+        next_tick = self.start_time + self.start_display_at
+        while not self._stop_event.is_set():
+            now = time.time()
+            wait = next_tick - now
+            if wait > 0:
+                self._stop_event.wait(timeout=min(wait, 0.1))
+                continue
+
+            elapsed_seconds = next_tick - self.start_time
+            window_end_seconds = elapsed_seconds - 1
+            self._process_window(window_end_seconds, elapsed_seconds)
+
+            next_tick += 1.0
+            if next_tick < time.time():
+                next_tick = time.time() + 1.0
+
+    def _process_window(self, window_end_seconds, display_at_seconds):
+        with self._lock:
+            trace_snapshot = list(self._trace)
+            ts_snapshot = list(self._timestamps)
+            mode_snapshot = list(self._mode_log)
+            reason_snapshot = list(self._reason_log)
+
+        window_start_seconds = max(0.0, window_end_seconds - self.buffer_seconds)
+        start_idx = bisect.bisect_left(ts_snapshot, window_start_seconds)
+        end_idx = bisect.bisect_left(ts_snapshot, window_end_seconds)
+        n = end_idx - start_idx
+        if n < 2:
+            return
+
+        window_rgb = np.array(trace_snapshot[start_idx:end_idx], dtype=float)
+
+        # ===== UNCHANGED: actual achieved sample rate from real timestamps,
+        # fed into the exact same, untouched algorithm functions. =====
+        span = ts_snapshot[end_idx - 1] - ts_snapshot[start_idx]
+        effective_fps = (n - 1) / span if span > 1e-6 else self.framerate
+        self.last_effective_fps = effective_fps
+
+        raw_pulse = pos_algorithm(
+            window_rgb, effective_fps,
+            window_seconds=self.window_seconds,
+            combine_method=self.pos_combine,
+        )
+        pulse = bandpass_filter(raw_pulse, effective_fps, self.low_hz, self.high_hz)
+        hr, freqs, psd = estimate_heart_rate(
+            pulse, effective_fps, self.low_hz, self.high_hz, self.nsegments,
+        )
+        # ===== end unchanged algorithm calls =====
+
+        self.current_hr = hr
+        self.last_pulse_signal = pulse
+        self.last_psd = (freqs, psd)
+        self.hr_history.append(hr)
+
+        # ===== NEW: SNR, computed from the (freqs, psd) that
+        # estimate_heart_rate() already returned above -- no new
+        # frequency analysis, no change to hr/pulse/psd themselves. =====
+        snr_db, target_hz = calculate_snr(
+            freqs, psd, hr, low_hz=self.low_hz, high_hz=self.high_hz,
+            signal_band_hz=self.snr_band_hz,
+            include_harmonic=self.snr_include_harmonic,
+        )
+        self.last_snr_db = snr_db
+        self.last_target_hz = target_hz
+        if snr_db is not None:
+            self.snr_history.append(snr_db)
+
+        # ===== PERFORMANCE DIAGNOSTICS: §11/§12 exact window-block format =====
+        mode_slice = mode_snapshot[start_idx:end_idx]
+        reason_slice = reason_snapshot[start_idx:end_idx]
+        mediapipe_frames = sum(1 for m in mode_slice if m is True)
+        tracker_frames = n - mediapipe_frames
+        mp_pct = (mediapipe_frames / n * 100.0) if n else 0.0
+        tr_pct = (tracker_frames / n * 100.0) if n else 0.0
+        redetections = sum(1 for r in reason_slice if r not in (None, "INITIAL"))
+        failures = sum(1 for r in reason_slice
+                        if r in ("TRACKER_FAILURE", "GEOMETRY_REJECTED",
+                                  "NO_MASK_TEMPLATE", "TRACKER_INIT_FAILED"))
+
+        duration = window_end_seconds - window_start_seconds
+        deficit = effective_fps - self.framerate
+        snr_str = f"{snr_db:.1f} dB" if snr_db is not None else "n/a"
+
+        if self.verbose:
+            print("=" * 60)
+            print(f"Window: {window_start_seconds:.1f} - {window_end_seconds:.1f} s")
+            print(f"Duration: {duration:.2f} s")
+            print(f"Samples: {n}")
+            print(f"Nominal FPS: {self.framerate:.2f}")
+            print(f"Actual FPS: {effective_fps:.2f}   (deficit: {deficit:+.2f})")
+            print(f"HR = {hr:.1f} BPM | Target = {target_hz:.3f} Hz | SNR = {snr_str}")
+            print(f"MediaPipe frames: {mediapipe_frames}")
+            print(f"{self.tracker_label} frames: {tracker_frames}")
+            print(f"MediaPipe usage: {mp_pct:.1f}%")
+            print(f"{self.tracker_label} usage: {tr_pct:.1f}%")
+            print(f"Re-detections: {redetections}")
+            print(f"Tracker failures: {failures}")
+            print("=" * 60)
+
+
+# =============================================================================
+# NEW / ===== KLT TRACKER CHANGE =====
+# Capture layer: camera opening (unchanged from before) and
+# MediaPipe-detection + KLT-tracking ROI acquisition.
+#
+# Nothing below this point touches build_roi_mask(), mean_skin_rgb(),
+# pos_algorithm(), bandpass_filter(), or estimate_heart_rate().
+# =============================================================================
+
+# --- tracking failure / re-detect thresholds (unchanged, adjust freely) ----
+TRACK_MAX_CENTER_JUMP_RATIO = 0.5
+TRACK_MIN_SIZE_RATIO = 0.4
+TRACK_MAX_SIZE_RATIO = 2.5
+# -----------------------------------------------------------------------
+
+# ===== KLT TRACKER CHANGE: Lucas-Kanade optical flow parameters =====
+KLT_LK_PARAMS = dict(
+    winSize=(31, 31),
+    maxLevel=4,
+    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+)
+KLT_GFTT_PARAMS = dict(
+    maxCorners=100,
+    qualityLevel=0.01,
+    minDistance=7,
+    blockSize=7,
+)
+KLT_MIN_POINTS = 8  # below this many surviving tracked points, treat as a failure
+KLT_SCALE_CLAMP = (0.5, 2.0)  # sanity clamp on per-frame bbox scale change
+# -----------------------------------------------------------------------
+
+
+def open_camera(camera_index, fourcc="MJPG", no_dshow=False, no_v4l2=False):
+    """Open a live camera.
+
+    IMPORTANT QUIRK this default works around: on Linux, opening via the
+    explicit cv2.CAP_V4L2 backend (needed elsewhere so an explicit FOURCC
+    request actually sticks) WITHOUT also telling it a FOURCC can cause
+    V4L2 to fall back to its own internal default pixel format -- on some
+    driver/webcam combinations that's an UNCOMPRESSED format (e.g. YUYV),
+    not the camera's true native default. The auto/"ANY" backend
+    (cv2.VideoCapture(idx) with no backend flag) would normally have
+    negotiated the camera's real default, typically compressed MJPEG --
+    but forcing V4L2 changes that unless a format is explicitly requested.
+
+    So the default here is now the explicit string "MJPG" (matching
+    almost every USB webcam's actual native compressed format), rather
+    than an empty/unrequested value -- this guarantees compressed
+    capture regardless of what V4L2's own internal fallback would have
+    picked. Pass fourcc="YUYV" (or any other explicit format) to force
+    uncompressed capture instead; pass fourcc="" to skip requesting any
+    format at all (only safe if you also pass no_v4l2=True, since
+    otherwise you're back to the quirk described above).
+
+    Either way, frames are never written to disk or re-encoded by this
+    script -- they're processed directly as arrays from camera.read();
+    any decompression from a compressed format like MJPEG happens
+    transparently inside OpenCV before that.
+    """
+    if sys.platform.startswith("linux") and not no_v4l2:
+        camera = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+    elif sys.platform.startswith("win") and not no_dshow:
+        camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    else:
+        camera = cv2.VideoCapture(camera_index)
+
+    if fourcc:
+        try:
+            camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+        except Exception as e:
+            print(f"WARNING: could not request FOURCC '{fourcc}' ({e}); "
+                  f"continuing with whatever format the backend falls "
+                  f"back to.")
+
+    return camera
+
+
+def print_negotiated_fourcc(camera, requested_fourcc):
+    """Never assume cap.set(CAP_PROP_FOURCC, ...) succeeded (or was even
+    requested) -- read back and print what the driver is actually
+    delivering. If no format was explicitly requested (requested_fourcc
+    is empty/falsy), this just reports the driver's own default --
+    normally a compressed codec like MJPEG on most webcams -- rather
+    than comparing against a request that was never made."""
+    actual_code = int(camera.get(cv2.CAP_PROP_FOURCC))
+    actual_str = "".join(chr((actual_code >> (8 * i)) & 0xFF) for i in range(4))
+    w = camera.get(cv2.CAP_PROP_FRAME_WIDTH)
+    h = camera.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    if requested_fourcc:
+        match = "OK" if actual_str.upper().rstrip() == requested_fourcc.upper().rstrip() else "DIFFERENT"
+        print(f"Camera negotiated FOURCC='{actual_str}' at {w:.0f}x{h:.0f} "
+              f"(requested '{requested_fourcc}') [{match}]")
+    else:
+        print(f"Camera negotiated FOURCC='{actual_str}' at {w:.0f}x{h:.0f} "
+              f"(no format explicitly requested -- using the camera's own "
+              f"default, typically compressed, e.g. MJPEG)")
+    return actual_str
+
+
+class FaceROITracker:
+    """
+    MediaPipe is used only for the INITIAL detection and for RECOVERY
+    after a tracking failure. On every other frame, KLT (Lucas-Kanade
+    pyramidal optical flow) advances a set of feature points selected
+    inside the last known skin/landmark mask, and the existing
+    landmark-derived skin-exclusion mask -- built once, by the
+    unmodified build_roi_mask(), at the last real detection -- is
+    repositioned (resized) onto KLT's newly estimated box. build_roi_mask()
+    and mean_skin_rgb() themselves are never touched.
+
+    ===== KLT TRACKER CHANGE =====
+    A runtime tracking failure (too few surviving points, or a
+    geometrically rejected box) NEVER permanently disables tracking --
+    it only triggers one MediaPipe recovery frame, then KLT tracking
+    resumes with a freshly selected set of feature points (§5/§6). The
+    only thing that makes MediaPipe run on every frame is the user
+    explicitly requesting --tracker none.
+
+    process() returns (mask_or_None, bbox_or_None, used_mediapipe: bool,
+    reason: str_or_None) where reason is one of:
+        None                  -- normal KLT-tracked frame
+        "INITIAL"              -- the very first-ever detection
+        "TRACKER_FAILURE"      -- fewer than KLT_MIN_POINTS points survived optical flow
+        "GEOMETRY_REJECTED"    -- points tracked ok, but the estimated box failed jump/size/bounds checks
+        "NO_MASK_TEMPLATE"     -- box ok, but no template to resize (rare)
+        "TRACKER_INIT_FAILED"  -- a fresh detection succeeded but goodFeaturesToTrack found too few features
+        "NO_TRACKER_AVAILABLE" -- --tracker none was requested; MediaPipe runs on every frame by design
+    """
+
+    def __init__(self, tracker_kind="klt", max_gap=5):
+        self.tracker_kind = tracker_kind  # "klt" or None (== --tracker none)
+        self.max_gap = max_gap
+        self.last_detect_bbox = None
+        self.last_full_mask = None
+        self.gap_count = 0
+
+        # ===== KLT TRACKER CHANGE: optical-flow state (replaces cv_tracker) =====
+        self.klt_prev_gray = None   # previous frame's grayscale image
+        self.klt_prev_pts = None    # previous frame's tracked points, Nx2 float32
+        self.klt_prev_bbox = None   # bbox those points correspond to
+
+        # ===== PERFORMANCE DIAGNOSTICS counters (unchanged) =====
+        self.redetect_count = 0          # MediaPipe calls after the very first
+        self.tracker_failure_count = 0   # times an ACTIVE tracker specifically failed
+        self.recovery_success_count = 0  # redetects that successfully re-seeded KLT features
+        self.mediapipe_frame_count = 0   # cumulative, every frame
+        self.tracker_frame_count = 0     # cumulative, every frame
+
+    @staticmethod
+    def _bbox_in_bounds(bbox, frame_shape):
+        bx, by, bw, bh = bbox
+        h, w = frame_shape[:2]
+        return bw > 0 and bh > 0 and bx >= 0 and by >= 0 and bx + bw <= w and by + bh <= h
+
+    def _tracking_ok(self, new_bbox, frame_shape):
+        if not self._bbox_in_bounds(new_bbox, frame_shape):
+            return False
+        if self.last_detect_bbox is None:
+            return True
+        ox, oy, ow, oh = self.last_detect_bbox
+        nx, ny, nw, nh = new_bbox
+        if ow <= 0 or oh <= 0:
+            return False
+        old_center = (ox + ow / 2.0, oy + oh / 2.0)
+        new_center = (nx + nw / 2.0, ny + nh / 2.0)
+        dist = ((old_center[0] - new_center[0]) ** 2 + (old_center[1] - new_center[1]) ** 2) ** 0.5
+        if dist > TRACK_MAX_CENTER_JUMP_RATIO * max(ow, oh):
+            return False
+        ratio = (nw * nh) / (ow * oh)
+        if ratio < TRACK_MIN_SIZE_RATIO or ratio > TRACK_MAX_SIZE_RATIO:
+            return False
+        return True
+
+    def _mask_for_bbox(self, bbox, frame_shape):
+        h, w = frame_shape[:2]
+        bx, by, bw, bh = [int(round(v)) for v in bbox]
+        if self.last_full_mask is None or self.last_detect_bbox is None:
+            return None
+        ox, oy, ow, oh = self.last_detect_bbox
+        template = self.last_full_mask[oy:oy + oh, ox:ox + ow]
+        if template.size == 0 or bw <= 0 or bh <= 0:
+            return None
+        resized = cv2.resize(template, (bw, bh), interpolation=cv2.INTER_NEAREST)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        mask[by:by + bh, bx:bx + bw] = resized
+        return mask
+
+    # ===== KLT TRACKER CHANGE: feature selection + bbox estimation helpers ====
+
+    @staticmethod
+    def _select_good_features(gray, mask):
+        """Pick corner-like points to track, restricted to the given mask
+        (the same landmark/skin-exclusion mask build_roi_mask() produced),
+        so KLT tracks stable skin texture rather than eyes/mouth/background."""
+        pts = cv2.goodFeaturesToTrack(gray, mask=mask, **KLT_GFTT_PARAMS)
+        if pts is None:
+            return None
+        return pts.reshape(-1, 2).astype(np.float32)
+
+    @staticmethod
+    def _estimate_bbox_from_points(old_pts, new_pts, prev_bbox):
+        """Estimate this frame's bbox from how the tracked points moved:
+        translation = median point displacement, scale = ratio of mean
+        radial spread around the centroid (new vs old). This is a simple,
+        robust similarity-transform estimate -- not a full affine fit --
+        deliberately kept lightweight since it only needs to feed the
+        existing _tracking_ok() geometry check and _mask_for_bbox() resize."""
+        ox, oy, ow, oh = prev_bbox
+        translation = np.median(new_pts - old_pts, axis=0)
+
+        if len(new_pts) >= 2:
+            old_c = old_pts.mean(axis=0)
+            new_c = new_pts.mean(axis=0)
+            old_spread = float(np.mean(np.linalg.norm(old_pts - old_c, axis=1)))
+            new_spread = float(np.mean(np.linalg.norm(new_pts - new_c, axis=1)))
+            scale = new_spread / old_spread if old_spread > 1e-3 else 1.0
+            scale = float(np.clip(scale, KLT_SCALE_CLAMP[0], KLT_SCALE_CLAMP[1]))
+        else:
+            scale = 1.0
+
+        cx = ox + ow / 2.0 + translation[0]
+        cy = oy + oh / 2.0 + translation[1]
+        new_w = ow * scale
+        new_h = oh * scale
+        return (cx - new_w / 2.0, cy - new_h / 2.0, new_w, new_h)
+
+    def _run_detection(self, frame, landmarker, timestamp_ms, reason, gray=None):
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+        was_redetect = reason != "INITIAL"
+
+        if gray is None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if not result.face_landmarks:
+            self.gap_count += 1
+            self.mediapipe_frame_count += 1
+            if self.last_full_mask is not None and self.gap_count <= self.max_gap:
+                return self.last_full_mask, self.last_detect_bbox, True, reason
+            return None, None, True, reason
+
+        landmarks_px = landmarks_to_pixels(result.face_landmarks[0], frame.shape)
+        mask, bbox = build_roi_mask(frame.shape, landmarks_px)  # UNCHANGED
+
+        if was_redetect:
+            self.redetect_count += 1
+        self.last_full_mask = mask
+        self.last_detect_bbox = bbox
+        self.gap_count = 0
+        self.mediapipe_frame_count += 1
+
+        # ===== KLT TRACKER CHANGE: (re)seed feature points instead of a cv2 tracker.
+        # Uses build_tracking_mask() (face oval, no eye/mouth exclusions) --
+        # NOT the skin-averaging `mask` above -- so KLT gets high-texture
+        # points (eye/mouth/nose edges) instead of flat, hard-to-track skin.
+        self.klt_prev_pts = None
+        self.klt_prev_gray = None
+        self.klt_prev_bbox = None
+        if self.tracker_kind is not None:
+            tracking_mask = build_tracking_mask(frame.shape, landmarks_px)
+            pts = self._select_good_features(gray, tracking_mask)
+            if pts is not None and len(pts) >= KLT_MIN_POINTS:
+                self.klt_prev_gray = gray
+                self.klt_prev_pts = pts
+                self.klt_prev_bbox = bbox
+                if was_redetect:
+                    self.recovery_success_count += 1
+            else:
+                n_found = 0 if pts is None else len(pts)
+                print(f"WARNING: KLT found only {n_found} trackable feature(s) "
+                      f"(< {KLT_MIN_POINTS}); will retry detection next frame.")
+
+        return mask, bbox, True, reason
+
+    def process(self, frame, landmarker, timestamp_ms):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if self.klt_prev_pts is None:
+            if self.last_detect_bbox is None:
+                reason = "INITIAL"
+            elif self.tracker_kind is None:
+                reason = "NO_TRACKER_AVAILABLE"
+            else:
+                reason = "TRACKER_INIT_FAILED"
+            return self._run_detection(frame, landmarker, timestamp_ms, reason, gray)
+
+        try:
+            new_pts_raw, status, _err = cv2.calcOpticalFlowPyrLK(
+                self.klt_prev_gray, gray,
+                self.klt_prev_pts.reshape(-1, 1, 2),
+                None, **KLT_LK_PARAMS,
+            )
+        except Exception as e:
+            print(f"WARNING: calcOpticalFlowPyrLK raised {e!r}; treating as "
+                  f"a tracking failure (this frame only -- tracking will "
+                  f"retry after MediaPipe recovers).")
+            new_pts_raw, status = None, None
+
+        if status is None or new_pts_raw is None:
+            valid_new = np.empty((0, 2), dtype=np.float32)
+        else:
+            status = status.reshape(-1)
+            valid_old_mask = status == 1
+            valid_new = new_pts_raw.reshape(-1, 2)[valid_old_mask]
+            valid_old = self.klt_prev_pts[valid_old_mask]
+
+        if len(valid_new) < KLT_MIN_POINTS:
+            self.tracker_failure_count += 1
+            self.klt_prev_pts = None
+            self.klt_prev_gray = None
+            return self._run_detection(frame, landmarker, timestamp_ms, "TRACKER_FAILURE", gray)
+
+        new_bbox = self._estimate_bbox_from_points(valid_old, valid_new, self.klt_prev_bbox)
+
+        if not self._tracking_ok(new_bbox, frame.shape):
+            self.tracker_failure_count += 1
+            self.klt_prev_pts = None
+            self.klt_prev_gray = None
+            return self._run_detection(frame, landmarker, timestamp_ms, "GEOMETRY_REJECTED", gray)
+
+        bbox = tuple(int(round(v)) for v in new_bbox)
+        mask = self._mask_for_bbox(bbox, frame.shape)
+        if mask is None:
+            self.tracker_failure_count += 1
+            self.klt_prev_pts = None
+            self.klt_prev_gray = None
+            return self._run_detection(frame, landmarker, timestamp_ms, "NO_MASK_TEMPLATE", gray)
+
+        # success: chain forward -- next frame tracks from these points
+        self.klt_prev_gray = gray
+        self.klt_prev_pts = valid_new.astype(np.float32)
+        self.klt_prev_bbox = bbox
+        self.tracker_frame_count += 1
+        return mask, bbox, False, None
+
+
+def process_single_frame(frame, roi_tracker, landmarker, timestamp_ms,
+                          use_color_skin_mask=True, image_show=False):
+    """Per-frame ROI acquisition (via roi_tracker) followed by the
+    UNCHANGED mean_skin_rgb() call.
+
+    Returns (rgb_or_None, used_mediapipe: bool, reason: str_or_None).
+    """
+    mask, bbox, used_mediapipe, reason = roi_tracker.process(frame, landmarker, timestamp_ms)
+
+    rgb = None
+    if mask is not None and bbox is not None:
+        bx, by, bw, bh = bbox
+        if bw > 0 and bh > 0:
+            face_crop = frame[by:by + bh, bx:bx + bw]
+            mask_crop = mask[by:by + bh, bx:bx + bw]
+            if face_crop.size > 0:
+                rgb = mean_skin_rgb(face_crop, mask_crop, use_color_skin_mask)  # UNCHANGED
+            if image_show:
+                color = (0, 255, 0) if used_mediapipe else (255, 200, 0)
+                cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), color, 2)
+
+    return rgb, used_mediapipe, reason
+
+
+def _gui_available():
+    try:
+        cv2.namedWindow("__gui_probe__", cv2.WINDOW_NORMAL)
+        cv2.destroyWindow("__gui_probe__")
+        return True
+    except cv2.error:
+        return False
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-v", "--video",
+                     help="optional video file to stream instead of a live "
+                          "camera (paced to real time via sleep)")
+    ap.add_argument("--camera_index", type=int, default=0,
+                     help="camera device index to use when --video is not given")
+    ap.add_argument("--framerate", type=float, default=30.0,
+                     help="nominal capture framerate; fallback only -- real "
+                          "elapsed time is what actually drives the HR math")
+    ap.add_argument("--face_model", default="face_landmarker.task")
+    ap.add_argument("--no_color_skin_mask", action="store_true")
+    ap.add_argument("--window_seconds", type=float, default=1.6,
+                     help="POS sliding-window length in seconds (paper default 1.6s)")
+    ap.add_argument("--pos_combine", choices=["alpha", "svd"], default="alpha")
+    ap.add_argument("--low_hz", type=float, default=0.7)
+    ap.add_argument("--high_hz", type=float, default=3.5)
+    ap.add_argument("--max_gap", type=int, default=5,
+                     help="max consecutive frames with no usable ROI before "
+                          "giving up on reusing the last known ROI")
+    ap.add_argument("--nsegments", type=int, default=12)
+    ap.add_argument("--snr_band_hz", type=float, default=0.2,
+                     help="half-width (Hz) of the SNR signal band around "
+                          "the estimated HR frequency (and its harmonic, "
+                          "if included). Default ±0.2 Hz, matching the "
+                          "standard rPPG SNR literature convention "
+                          "(de Haan & Jeanne 2013 / Poh et al. 2010).")
+    ap.add_argument("--snr_no_harmonic", action="store_true",
+                     help="exclude the HR's 2nd harmonic (2x the pulse "
+                          "frequency) from the SNR signal power -- by "
+                          "default it IS included (matching the standard "
+                          "rPPG SNR formula, which treats fundamental + "
+                          "first harmonic as signal), when that harmonic "
+                          "falls inside [--low_hz, --high_hz].")
+    ap.add_argument("--start_display_at", type=float, default=11.0,
+                     help="second at which the first HR value is computed/shown")
+    ap.add_argument("--buffer_seconds", type=float, default=10.0,
+                     help="width of the rolling window in seconds (default 10s)")
+    ap.add_argument("--image_show", action="store_true",
+                     help="show a live window with the camera feed and HR overlay")
+    ap.add_argument("--fourcc", default="MJPG",
+                     help="pixel format to explicitly request from the "
+                          "camera. Default 'MJPG' -- the camera's normal "
+                          "compressed format on almost all USB webcams. "
+                          "(Left unrequested, forcing the V4L2/DirectShow "
+                          "backend used elsewhere for reliable FOURCC "
+                          "control can itself cause an uncompressed "
+                          "fallback on some drivers -- explicitly asking "
+                          "for MJPG avoids that.) Pass e.g. YUYV to force "
+                          "uncompressed capture instead, or '' to request "
+                          "nothing at all.")
+    ap.add_argument("--no_dshow", action="store_true",
+                     help="on Windows, don't force the DirectShow backend")
+    ap.add_argument("--no_v4l2", action="store_true",
+                     help="on Linux, don't force the V4L2 backend")
+    # ===== KLT TRACKER CHANGE: KLT replaces kcf/mosse as the only tracked option =====
+    ap.add_argument("--tracker", choices=["klt", "none"], default="klt",
+                     help="lightweight tracker used between MediaPipe "
+                          "detections. Default is KLT (Lucas-Kanade "
+                          "pyramidal optical flow, cv2.calcOpticalFlowPyrLK). "
+                          "'none' disables tracking and runs MediaPipe on "
+                          "every frame.")
+    ap.add_argument("--verbose_frames", action="store_true",
+                     help="print a diagnostic line for every single frame "
+                          "(frame number, elapsed time, fps, mode, and, on "
+                          "re-detect frames, the reason + recovery result). "
+                          "Off by default -- the per-10s-window block below "
+                          "is the primary output.")
+    args = ap.parse_args()
+
+    if args.video:
+        camera = cv2.VideoCapture(1)
+        is_file = True
+    else:
+        camera = open_camera(1, fourcc=args.fourcc,
+                              no_dshow=args.no_dshow, no_v4l2=args.no_v4l2)
+        is_file = False
+    if not camera.isOpened():
+        raise RuntimeError("Cannot open video source.")
+
+    if not is_file:
+        print_negotiated_fourcc(camera, args.fourcc)
+    else:
+        # ===== §19 video-file behavior: don't confuse video FPS with
+        # actual processing FPS -- state the pacing explicitly. =====
+        print(f"Processing video file '{args.video}', paced to real time via "
+              f"sleep so the same 1s-per-window HR schedule applies as a "
+              f"live camera would get. --framerate is only the pacing "
+              f"target; actual FPS used for the HR math is measured from "
+              f"real timestamps, same as with a live camera.")
+
+    model_path = ensure_face_landmarker_model(args.face_model)
+    landmarker = build_face_landmarker(model_path)
+
+    # ===== KLT TRACKER CHANGE: KLT ships in core opencv-python, so there is
+    # no contrib-module capability check needed the way KCF/MOSSE required. =====
+    tracker_kind = None if args.tracker == "none" else args.tracker
+    if tracker_kind is not None:
+        print(f"OpenCV version: {cv2.__version__}")
+        print("KLT tracker (cv2.calcOpticalFlowPyrLK): available "
+              "(ships with core opencv-python, no opencv-contrib-python required)")
+
+    tracker_label = tracker_kind.upper() if tracker_kind else "NONE"
+    print(f"Tracker: {tracker_label}")
+
+    roi_tracker = FaceROITracker(tracker_kind=tracker_kind, max_gap=args.max_gap)
+
+    monitor = RealTimeHeartRateMonitor(
+        framerate=args.framerate,
+        start_display_at=args.start_display_at,
+        buffer_seconds=args.buffer_seconds,
+        window_seconds=args.window_seconds,
+        pos_combine=args.pos_combine,
+        low_hz=args.low_hz,
+        high_hz=args.high_hz,
+        nsegments=args.nsegments,
+        tracker_label=tracker_label,
+        snr_band_hz=args.snr_band_hz,
+        snr_include_harmonic=not args.snr_no_harmonic,
+    )
+
+    last_timestamp_ms = -1
+    frame_number = 0
+    frame_interval = 1.0 / args.framerate
+    recent_frame_times = []
+    FPS_WINDOW = 15
+
+    image_show = args.image_show
+    if image_show and not _gui_available():
+        print("WARNING: --image_show was requested but this OpenCV build "
+              "has no GUI backend. Falling back to console-only output.")
+        image_show = False
+
+    print(f"Streaming... collecting baseline for {args.start_display_at:.0f}s "
+          f"before the first HR estimate is shown.")
+
+    monitor.start()
+    try:
+        while True:
+            loop_start = time.time()
+
+            grabbed, frame = camera.read()
+            if not grabbed:
+                print("End of stream / camera read failed.")
+                break
+
+            timestamp_ms = int(round((time.time() - monitor.start_time) * 1000.0))
+            if timestamp_ms <= last_timestamp_ms:
+                timestamp_ms = last_timestamp_ms + 1
+            last_timestamp_ms = timestamp_ms
+
+            rgb, used_mediapipe, reason = process_single_frame(
+                frame, roi_tracker, landmarker, timestamp_ms,
+                use_color_skin_mask=not args.no_color_skin_mask,
+                image_show=image_show,
+            )
+
+            if rgb is None:
+                if monitor.n_samples() > 0:
+                    with monitor._lock:
+                        rgb = tuple(monitor._trace[-1])
+
+            if rgb is not None:
+                monitor.append_sample(rgb, used_mediapipe=used_mediapipe, reason=reason)
+
+            frame_number += 1
+            recent_frame_times.append(loop_start)
+            if len(recent_frame_times) > FPS_WINDOW:
+                recent_frame_times.pop(0)
+            if len(recent_frame_times) >= 2:
+                span = recent_frame_times[-1] - recent_frame_times[0]
+                current_fps = (len(recent_frame_times) - 1) / span if span > 1e-6 else 0.0
+            else:
+                current_fps = 0.0
+
+            # ===== PERFORMANCE DIAGNOSTICS: §10 per-frame verbose format =====
+            mode_str = "MEDIAPIPE" if used_mediapipe else roi_tracker.tracker_kind.upper() if roi_tracker.tracker_kind else "MEDIAPIPE"
+            if args.verbose_frames:
+                elapsed_total = time.time() - monitor.start_time
+                print(f"frame={frame_number:<6d} time={elapsed_total:6.2f}s   "
+                      f"fps={current_fps:5.1f}   mode={mode_str}")
+                if reason not in (None, "INITIAL"):
+                    recovered = roi_tracker.klt_prev_pts is not None
+                    print(f"          reason={reason}  "
+                          f"recovery={'SUCCESS' if recovered else 'FAILED'}")
+
+            if image_show:
+                elapsed = time.time() - monitor.start_time
+                if monitor.current_hr is not None:
+                    label = f"HR: {monitor.current_hr:.1f} bpm  [{mode_str}]"
+                    color = (0, 255, 0)
+                else:
+                    remaining = max(0.0, args.start_display_at - elapsed)
+                    label = f"Collecting baseline... {remaining:.1f}s  [{mode_str}]"
+                    color = (0, 165, 255)
+                cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.9, color, 2, cv2.LINE_AA)
+                try:
+                    cv2.imshow("Real-time rPPG", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                except cv2.error as e:
+                    print(f"WARNING: display window failed ({e}); "
+                          f"continuing in console-only mode.")
+                    image_show = False
+
+            if is_file:
+                elapsed_loop = time.time() - loop_start
+                sleep_left = frame_interval - elapsed_loop
+                if sleep_left > 0:
+                    time.sleep(sleep_left)
+    except KeyboardInterrupt:
+        print("Interrupted by user.")
+    finally:
+        monitor.stop()
+        camera.release()
+        landmarker.close()
+        if image_show:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
+
+    # ===== PERFORMANCE DIAGNOSTICS: §15 final performance summary =====
+    total_duration = (time.time() - monitor.start_time) if monitor.start_time else 0.0
+    avg_actual_fps = frame_number / total_duration if total_duration > 1e-6 else 0.0
+    mp_total = roi_tracker.mediapipe_frame_count
+    tr_total = roi_tracker.tracker_frame_count
+    total_for_pct = mp_total + tr_total
+    mp_pct = (mp_total / total_for_pct * 100.0) if total_for_pct else 0.0
+    tr_pct = (tr_total / total_for_pct * 100.0) if total_for_pct else 0.0
+    avg_hr = statistics.mean(monitor.hr_history) if monitor.hr_history else None
+    avg_snr = statistics.mean(monitor.snr_history) if monitor.snr_history else None
+
+    print("================= FINAL PERFORMANCE =================")
+    print(f"Total frames:               {frame_number}")
+    print(f"Total duration:             {total_duration:.2f} s")
+    print(f"Average actual FPS:         {avg_actual_fps:.2f}")
+    print(f"Nominal FPS:                {args.framerate:.2f}")
+    print()
+    print(f"MediaPipe frames:           {mp_total}")
+    print(f"{tracker_label} frames:           {tr_total}")
+    print()
+    print(f"MediaPipe usage:            {mp_pct:.1f} %")
+    print(f"{tracker_label} usage:            {tr_pct:.1f} %")
+    print()
+    print(f"Tracker failures:           {roi_tracker.tracker_failure_count}")
+    print(f"Successful recoveries:      {roi_tracker.recovery_success_count}")
+    print()
+    print(f"Average HR:                 "
+          f"{avg_hr:.2f} BPM" if avg_hr is not None else "Average HR:                 n/a")
+    print(f"Average SNR:                "
+          f"{avg_snr:.1f} dB" if avg_snr is not None else "Average SNR:                n/a")
+    print("=======================================================")
+
+    if monitor.current_hr is not None:
+        print(f"Final displayed heart rate: {monitor.current_hr:.2f} bpm")
+    else:
+        print("Stream ended before the first HR estimate could be computed "
+              f"(needs >= {args.start_display_at:.0f}s of footage with a "
+              "detected face).")
+
+
+if __name__ == "__main__":
+    main()
