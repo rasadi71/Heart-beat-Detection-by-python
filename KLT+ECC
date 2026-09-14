@@ -1,0 +1,1456 @@
+"""
+Real-time pulse extraction using the POS algorithm.
+
+pos_algorithm(), bandpass_filter(), estimate_heart_rate(), calculate_snr(),
+mean_skin_rgb(), landmarks_to_pixels(), build_face_landmarker(), and
+ensure_face_landmarker_model() are copied VERBATIM and never touched by
+any of the tracker/diagnostics work below.
+
+# ===== ROI ARCHITECTURE CHANGE =====
+Per explicit request, the rPPG ROI is now the union of four small
+anatomical patches -- forehead, left cheek, right cheek, chin -- instead
+of the previous whole-face-oval-minus-eyes/mouth mask. Each patch is a
+square centered on a single stable MediaPipe landmark anchor (see
+_ROI_ANCHOR_LANDMARKS), sized relative to detected face width so it
+scales with camera distance. build_roi_mask() keeps its old signature
+(returns (mask, bbox)) so mean_skin_rgb() and every downstream POS/
+filter/HR/SNR call is completely unaffected -- only WHICH pixels feed
+mean_skin_rgb() has changed, not how they are used afterward.
+
+# ===== TRACKING ARCHITECTURE CHANGE =====
+Flow: MediaPipe init -> ROI definition -> KLT -> (<=10% movement: KLT
+continues) -> (>10% movement: ROI-only ECC realignment) -> update ROI
+-> KLT resumes -> MediaPipe recovery only if KLT/ECC cannot maintain
+the ROI.
+
+  - MediaPipe runs only for the INITIAL detection and for genuine
+    RECOVERY (severe feature loss, failed optical flow, failed ECC
+    convergence, invalid ROI, face leaving frame). It is never
+    triggered merely because movement exceeded 10%.
+  - KLT (cv2.calcOpticalFlowPyrLK) tracks a set of feature points
+    selected (cv2.goodFeaturesToTrack) across the whole face-oval region
+    (build_tracking_mask(), unchanged from the prior tracker version) --
+    NOT restricted to the four rPPG patches -- because flat cheek/
+    forehead/chin skin is poor KLT material on its own; eyes/mouth/nose
+    edges give far more reliable motion estimates. This tracking mask is
+    used ONLY to estimate motion, never to select which pixels are
+    averaged for the rPPG signal.
+  - Every frame, the median DISPLACEMENT MAGNITUDE of the valid tracked
+    points (np.median(norm(new_pts - old_pts)), not the median of the
+    translation vector's components -- robust to a few bad optical-flow
+    points) is normalized by the ROI diagonal (sqrt(w^2+h^2) of the
+    union of the four ROI patches at last MediaPipe (re)detection):
+    normalized_motion = median_displacement / roi_diagonal. Separately,
+    the median translation VECTOR + mean-radial scale change of the same
+    points gives one rigid (translation + uniform scale) transform,
+    applied identically to all four ROI rectangles (assumes the face
+    plane moves ~rigidly frame-to-frame at 30 fps) -- that transform is
+    what actually moves the ROI; normalized_motion only decides KLT vs ECC.
+  - If normalized_motion <= motion_threshold (default 0.05, i.e. 5% of
+    the ROI diagonal; tunable via FaceROITracker(motion_threshold=...)
+    / --ecc_motion_threshold, NOT a fixed pixel count), that transform is
+    accepted directly ("KLT" frame).
+  - If it exceeds motion_threshold, cv2.findTransformECC() is run SEPARATELY on each
+    of the four small ROI patches (never on the whole frame or face) --
+    template = last known-good patch pixels, input = a same-size crop of
+    the CURRENT frame at the KLT-predicted candidate location. ECC only
+    estimates a small residual translational correction to that
+    location; it never supplies or alters pixel intensities. After
+    ECC, KLT is RE-SEEDED from the corrected ROI patches and tracking
+    resumes ("ECC" frame, occasional, not a continuous tracker).
+  - If KLT loses too many points, or ECC fails to converge on a majority
+    of the four patches, or the resulting ROI leaves the frame, that
+    triggers a genuine MediaPipe recovery, which redefines all four ROIs
+    from scratch and reseeds KLT.
+
+Whichever mechanism supplied the current frame's ROI, the actual
+rPPG pixel values are always read fresh, unmodified, from the raw
+current frame at the final ROI location via the unmodified
+mean_skin_rgb() -- ECC/KLT never interpolate, smooth, or otherwise
+alter the measured pixel intensities themselves; they only decide WHERE
+to look.
+
+# ===== PERFORMANCE DIAGNOSTICS =====
+The 10-second-window summary keeps every original line (MediaPipe
+frames/usage, Re-detections, Tracker failures, actual vs nominal FPS,
+HR, SNR) and additionally reports KLT frames/usage, ECC frames/usage,
+KLT failures, and ECC activations/failures, per the requested
+architecture. The final end-of-run summary reports the same, plus
+MediaPipe re-detections and average actual FPS.
+
+Requires: pip install mediapipe opencv-python scipy numpy
+"""
+
+import os
+import sys
+import time
+import bisect
+import threading
+import argparse
+import statistics
+import urllib.request
+
+import numpy as np
+import cv2
+from scipy.signal import welch, butter, filtfilt
+
+import mediapipe as mp
+from mediapipe.tasks.python.core.base_options import BaseOptions
+from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
+    VisionTaskRunningMode,
+)
+from mediapipe.tasks.python.vision.face_landmarker import (
+    FaceLandmarker,
+    FaceLandmarkerOptions,
+    FaceLandmarksConnections,
+)
+
+sys.path.insert(0, "./SkinDetector")
+import skin_detector  # noqa: E402
+
+FACE_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+
+
+def ensure_face_landmarker_model(model_path):
+    if os.path.exists(model_path):
+        return model_path
+    print(f"Downloading Face Landmarker model to {model_path} ...")
+    try:
+        urllib.request.urlretrieve(FACE_LANDMARKER_MODEL_URL, model_path)
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not download {FACE_LANDMARKER_MODEL_URL} ({e}). "
+            f"If this network is blocked, download the file manually from "
+            f"that URL and pass its path via --face_model."
+        )
+    return model_path
+
+
+def build_face_landmarker(model_path):
+    options = FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=model_path),
+        running_mode=VisionTaskRunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return FaceLandmarker.create_from_options(options)
+
+
+def _connection_indices(connections):
+    idx = set()
+    for c in connections:
+        idx.add(c.start)
+        idx.add(c.end)
+    return sorted(idx)
+
+
+_FACE_OVAL_IDX = _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_FACE_OVAL)
+_EXCLUDE_IDX_GROUPS = [
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYE),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYE),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LEFT_EYEBROW),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_RIGHT_EYEBROW),
+    _connection_indices(FaceLandmarksConnections.FACE_LANDMARKS_LIPS),
+]
+
+
+def _dilate_hull(hull_pts, pad_ratio):
+    pts = hull_pts.reshape(-1, 2).astype(np.float32)
+    centroid = pts.mean(axis=0)
+    pts = centroid + (pts - centroid) * (1.0 + pad_ratio)
+    return pts.astype(np.int32).reshape(-1, 1, 2)
+
+
+def landmarks_to_pixels(face_landmarks, frame_shape):
+    h, w = frame_shape[:2]
+    pts = np.array([[lm.x * w, lm.y * h] for lm in face_landmarks], dtype=np.float32)
+    return pts
+
+
+# ===== ROI ARCHITECTURE CHANGE: four-patch rPPG ROI (forehead, cheeks, chin) =====
+# Anchor landmark indices are standard, well-documented MediaPipe FaceMesh
+# (468/478-point topology) points: 9 = mid-forehead (above glabella, below
+# hairline), 50 = left cheek, 280 = right cheek, 152 = chin tip. Each ROI
+# is a small square centered on its anchor, sized relative to the detected
+# face width (via the face-oval bounding box) so it scales with camera
+# distance.
+_ROI_ANCHOR_LANDMARKS = {
+    "forehead": 9,
+    "left_cheek": 50,
+    "right_cheek": 280,
+    "chin": 152,
+}
+_ROI_PATCH_SIZE_RATIO = 0.16   # patch side length as a fraction of face width
+_ROI_PATCH_MIN_PX = 14         # floor, so patches stay usable when the face is small/far
+
+
+def compute_roi_rects(frame_shape, landmarks_px):
+    """Returns {name: (x, y, w, h)} for forehead/left_cheek/right_cheek/chin,
+    each a square patch anchored on a stable landmark. This is the single
+    source of truth for ROI geometry -- used both for the initial
+    MediaPipe-based definition and, implicitly, by the KLT/ECC tracker
+    which moves these same rectangles frame to frame."""
+    oval_pts = landmarks_px[_FACE_OVAL_IDX].astype(np.int32)
+    oval_hull = cv2.convexHull(oval_pts)
+    _, _, ow, _oh = cv2.boundingRect(oval_hull)
+    patch_side = max(int(round(ow * _ROI_PATCH_SIZE_RATIO)), _ROI_PATCH_MIN_PX)
+    half = patch_side / 2.0
+
+    rects = {}
+    for name, idx in _ROI_ANCHOR_LANDMARKS.items():
+        cx, cy = landmarks_px[idx]
+        rects[name] = (float(cx - half), float(cy - half), float(patch_side), float(patch_side))
+    return rects
+
+
+def _mask_from_rects(frame_shape, rects):
+    """Union mask of a set of {name: (x,y,w,h)} rectangles, clipped to the
+    frame, plus the bounding box of that union (or None if empty)."""
+    h, w = frame_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    for (x, y, rw, rh) in rects.values():
+        x0, y0 = int(round(x)), int(round(y))
+        x1, y1 = int(round(x + rw)), int(round(y + rh))
+        x0c, y0c = max(0, x0), max(0, y0)
+        x1c, y1c = min(w, x1), min(h, y1)
+        if x1c > x0c and y1c > y0c:
+            mask[y0c:y1c, x0c:x1c] = 255
+    if not np.any(mask):
+        return mask, None
+    bbox = cv2.boundingRect(cv2.findNonZero(mask))
+    return mask, bbox
+
+
+def build_roi_mask(frame_shape, landmarks_px):
+    """rPPG ROI mask = union of the four square patches (forehead, left
+    cheek, right cheek, chin). Same (mask, bbox) return signature as
+    before, so mean_skin_rgb() and every caller downstream is unaffected
+    -- only WHICH pixels are inside `mask` has changed."""
+    rects = compute_roi_rects(frame_shape, landmarks_px)
+    mask, bbox = _mask_from_rects(frame_shape, rects)
+    if bbox is None:
+        oval_pts = landmarks_px[_FACE_OVAL_IDX].astype(np.int32)
+        bbox = cv2.boundingRect(cv2.convexHull(oval_pts))
+    return mask, bbox
+
+
+# ===== tracking-only mask (unrelated to which pixels feed POS): the whole
+# face oval, WITHOUT excluding eyes/mouth, used only to give KLT enough
+# high-texture corners to track reliably. The four rPPG ROI patches above
+# are moved by the resulting motion estimate; they are never used to pick
+# tracking points, since flat cheek/forehead/chin skin tracks poorly on
+# its own. =====
+def build_tracking_mask(frame_shape, landmarks_px):
+    h, w = frame_shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    oval_pts = landmarks_px[_FACE_OVAL_IDX].astype(np.int32)
+    oval_hull = cv2.convexHull(oval_pts)
+    cv2.fillConvexPoly(mask, oval_hull, 255)
+    return mask
+
+
+def mean_skin_rgb(frame_bgr, landmark_mask, use_color_skin_mask=True):
+    mask = landmark_mask
+    if use_color_skin_mask:
+        color_mask = skin_detector.process(frame_bgr)
+        mask = cv2.bitwise_and(mask, color_mask)
+
+    masked_face = cv2.bitwise_and(frame_bgr, frame_bgr, mask=mask)
+    n_skin = int(np.sum(mask > 0))
+    if n_skin == 0:
+        return None
+    r = np.sum(masked_face[:, :, 2]) / n_skin
+    g = np.sum(masked_face[:, :, 1]) / n_skin
+    b = np.sum(masked_face[:, :, 0]) / n_skin
+    return r, g, b
+
+
+def pos_algorithm(mean_rgb, framerate, window_seconds=1.6, eps=1e-9, combine_method="alpha"):
+    n = mean_rgb.shape[0]
+    l = int(round(framerate * window_seconds))
+    l = max(l, 2)
+
+    H = np.zeros(n)
+    projection_matrix = np.array([[0, 1, -1], [-2, 1, 1]])
+    identity_2x2 = np.eye(2)
+
+    for t in range(0, n - l + 1):
+        C = mean_rgb[t:t + l, :].T  # (3, l)
+
+        mean_color = np.mean(C, axis=1)
+        mean_color = np.where(np.abs(mean_color) < eps, eps, mean_color)
+        diag_mean_color_inv = np.diag(1.0 / mean_color)
+
+        Cn = diag_mean_color_inv @ C
+        S = projection_matrix @ Cn  # (2, l)
+
+        if combine_method == "svd":
+            try:
+                U, _sing, _Vt = np.linalg.svd(S, full_matrices=False)
+            except np.linalg.LinAlgError:
+                continue
+            q1 = U[:, 0]
+            proj = identity_2x2 - np.outer(q1, q1)
+            u = proj @ S
+            P = u[0, :]
+        else:  # "alpha" (default, original POS)
+            std0 = np.std(S[0, :])
+            std1 = np.std(S[1, :])
+            alpha = std0 / std1 if std1 > eps else 0.0
+            std_vec = np.array([1.0, alpha])
+            P = std_vec @ S
+
+        p_std = np.std(P)
+        if p_std < eps:
+            continue
+        H[t:t + l] += (P - np.mean(P)) / p_std
+
+    return H
+
+
+def bandpass_filter(signal, framerate, low_hz=0.7, high_hz=3.5, order=3):
+    nyq = framerate / 2.0
+    low = max(low_hz / nyq, 1e-4)
+    high = min(high_hz / nyq, 0.999)
+    b, a = butter(order, [low, high], btype="bandpass")
+    padlen = 3 * max(len(a), len(b))
+    if len(signal) <= padlen:
+        padlen = max(len(signal) - 1, 0)
+    return filtfilt(b, a, signal, padlen=padlen)
+
+
+def estimate_heart_rate(signal, framerate, low_hz=0.7, high_hz=3.5, nsegments=12,
+                         freq_resolution_hz=0.01):
+    segment_length = (2 * signal.shape[0]) // (nsegments + 1)
+    segment_length = max(segment_length, 8)
+    segment_length = min(segment_length, signal.shape[0])
+
+    nfft = 1
+    target = int(framerate / freq_resolution_hz)
+    while nfft < max(segment_length, target):
+        nfft *= 2
+
+    f, psd = welch(signal, framerate, window="hamming",
+                    nperseg=segment_length, nfft=nfft)
+
+    band = np.where((f >= low_hz) & (f <= high_hz))[0]
+    if band.size == 0:
+        raise RuntimeError("No frequency bins fall inside the requested HR band.")
+
+    max_idx = np.argmax(psd[band])
+    f_max = f[band[max_idx]]
+    hr = f_max * 60.0
+    return hr, f, psd
+
+
+# =============================================================================
+# NEW: SNR calculation. This is a separate, additive function -- it does
+# NOT modify estimate_heart_rate() or anything it calls. It consumes
+# exactly the (freqs, psd) that estimate_heart_rate() already returns
+# (the Welch PSD of the actual band-passed rPPG pulse signal, i.e. the
+# same "signal"/"pulse" that produced the HR value -- never the raw RGB
+# trace), plus the HR value estimate_heart_rate() already computed from
+# that same PSD, so no frequency analysis is duplicated or redone
+# differently.
+#
+# Matches the canonical rPPG SNR definition used in the literature (de
+# Haan & Jeanne 2013 "Robust Pulse-rate From Chrominance-based rPPG";
+# Poh et al. 2010; and the formulation referenced in PMC5480591):
+#     SNR = 10*log10( power around the pulse frequency (+ harmonic)
+#                     / remaining power within the physiological HR band )
+# NOT "cardiac power / all raw reflected-light power" -- the denominator
+# was already restricted to the physiological band below (see
+# physio_mask), never the full unrestricted Welch spectrum. The two
+# defaults changed to match that literature convention explicitly:
+# include_harmonic now defaults to True (the classic formula treats the
+# fundamental AND first harmonic as "signal" by default, not as an
+# opt-in extra), and signal_band_hz defaults to 0.2 Hz (the standard
+# half-bandwidth used in that formulation, was 0.1 Hz before).
+# =============================================================================
+
+def calculate_snr(freqs, psd, hr_bpm, low_hz=0.7, high_hz=3.5,
+                   signal_band_hz=0.2, include_harmonic=True):
+    """
+    SNR (dB) of the rPPG pulse signal, using the estimated HR only to
+    locate WHERE the expected pulse frequency sits -- HR itself is never
+    used as a power/amplitude value. The actual power numbers come
+    entirely from the PSD bins (the real Welch spectrum of the pulse
+    signal), which is what "signal power" and "noise power" are measured
+    from below.
+
+    Definitions (canonical rPPG SNR, e.g. de Haan & Jeanne 2013):
+      - target_hz = HR_bpm / 60           -- expected pulse frequency location
+      - signal band:  [target_hz - signal_band_hz, target_hz + signal_band_hz]
+                       UNION a matching band around the 2nd harmonic,
+                       2*target_hz, when include_harmonic=True (the
+                       default) and that harmonic falls inside
+                       [low_hz, high_hz] -- both fundamental and first
+                       harmonic count as "signal" in the standard formula.
+      - noise band:   [low_hz, high_hz] MINUS the signal band(s) above
+                       -- i.e. every OTHER frequency component that's
+                       still physiologically plausible (within the same
+                       band the HR search itself was restricted to), but
+                       isn't where the detected pulse (or its harmonic)
+                       sits. This is deliberately NOT the full 0-to-Nyquist
+                       Welch spectrum -- energy outside [low_hz, high_hz]
+                       (e.g. very low-frequency drift, high-frequency
+                       motion noise) is excluded from both signal and
+                       noise, matching "remaining power in the selected
+                       HR band," not "all raw reflected-light power."
+
+    Signal power = sum of PSD magnitude in the signal band(s).
+    Noise power  = sum of PSD magnitude in the remaining physiological
+                   band, excluding the signal band(s).
+    SNR_dB = 10 * log10(signal_power / noise_power).
+
+    Returns (snr_db_or_None, target_hz). snr_db is None if there isn't
+    enough spectrum to compute a meaningful ratio (e.g. noise_power == 0).
+    """
+    target_hz = hr_bpm / 60.0
+
+    # The full physiologically-plausible band we're allowed to look at --
+    # same [low_hz, high_hz] the HR search itself was restricted to. Both
+    # signal_mask and noise_mask below are ANDed with this, so neither
+    # one ever includes energy from outside the HR band -- the "remaining
+    # power in the selected HR band" denominator from the literature
+    # formula, not the unrestricted raw spectrum.
+    physio_mask = (freqs >= low_hz) & (freqs <= high_hz)
+
+    # --- signal band: real PSD power around the detected pulse frequency ---
+    signal_mask = physio_mask & (freqs >= target_hz - signal_band_hz) & \
+                  (freqs <= target_hz + signal_band_hz)
+
+    if include_harmonic:
+        harmonic_hz = 2.0 * target_hz
+        if low_hz <= harmonic_hz <= high_hz:
+            harmonic_mask = physio_mask & (freqs >= harmonic_hz - signal_band_hz) & \
+                             (freqs <= harmonic_hz + signal_band_hz)
+            signal_mask = signal_mask | harmonic_mask
+
+    # --- noise band: everything else inside the physiological band ---
+    # (physio_mask here is what keeps this "remaining power in the
+    # selected HR band" rather than "all raw reflected-light power.")
+    noise_mask = physio_mask & ~signal_mask
+
+    # Sum (not mean) of PSD bins in each band = total power in that band --
+    # this is the actual sampled spectrum's energy, not a derived/assumed
+    # value, and HR does not appear anywhere in these two sums except as
+    # the band boundary that was used to select which bins belong where.
+    signal_power = float(np.sum(psd[signal_mask])) if np.any(signal_mask) else 0.0
+    noise_power = float(np.sum(psd[noise_mask])) if np.any(noise_mask) else 0.0
+
+    if signal_power <= 0.0 or noise_power <= 0.0:
+        return None, target_hz
+
+    snr_db = 10.0 * np.log10(signal_power / noise_power)
+    return snr_db, target_hz
+# ===== PERFORMANCE DIAGNOSTICS =====
+# Added: a parallel per-sample mode/reason log (which frames in this
+# window were MediaPipe/KLT/ECC, and why any re-detections happened),
+# so the window summary can report the requested breakdown. This never
+# feeds into the HR math -- it's read-only bookkeeping alongside the
+# already-existing rgb/timestamp trace.
+# =============================================================================
+
+class RealTimeHeartRateMonitor:
+    """
+    Owns the growing mean-RGB trace and a background thread that, once a
+    second, runs the (unmodified) POS -> band-pass -> HR-estimation
+    pipeline on the samples collected so far and updates `current_hr`.
+
+    `framerate` is only a *fallback/nominal* value. Frames are
+    timestamped with the real wall-clock time they were captured at, and
+    windows are selected by real elapsed time. The *actual* achieved
+    sample rate within each window is what gets passed to
+    pos_algorithm/bandpass_filter/estimate_heart_rate.
+
+    Fixed-width rolling buffer of length `buffer_seconds` (default 10s),
+    sliding by 1s every second, starting at `start_display_at`.
+    """
+
+    def __init__(self, framerate, start_display_at=11, buffer_seconds=10.0,
+                 window_seconds=1.6, pos_combine="alpha", low_hz=0.7,
+                 high_hz=3.5, nsegments=12, verbose=True,
+                 snr_band_hz=0.2, snr_include_harmonic=True):
+        self.framerate = framerate  # nominal fallback only, see class docstring
+        self.start_display_at = start_display_at
+        self.buffer_seconds = buffer_seconds
+        self.window_seconds = window_seconds
+        self.pos_combine = pos_combine
+        self.low_hz = low_hz
+        self.high_hz = high_hz
+        self.nsegments = nsegments
+        self.verbose = verbose
+        self.snr_band_hz = snr_band_hz              # NEW: SNR signal-band half-width (Hz)
+        self.snr_include_harmonic = snr_include_harmonic  # NEW: include 2nd-harmonic band
+
+        self._trace = []       # rolling list of [r, g, b] rows
+        self._timestamps = []  # parallel: seconds since start_time for each row
+        self._mode_log = []    # parallel: "MEDIAPIPE" / "KLT" / "ECC" for each sample
+        self._reason_log = []  # parallel: None, "INITIAL", or a failure-reason code
+        self._disp_log = []    # parallel: median point displacement (px), or None
+        self._norm_motion_log = []  # parallel: normalized_motion (disp/ROI diagonal), or None
+        self._total_appended = 0
+        self._keep_seconds = buffer_seconds + 2.0
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = None
+
+        self.start_time = None
+        self.current_hr = None
+        self.last_pulse_signal = None
+        self.last_psd = None
+        self.last_effective_fps = None
+        self.last_snr_db = None        # NEW: most recent SNR (None if not computable)
+        self.last_target_hz = None     # NEW: HR converted to Hz, for display
+        self.hr_history = []   # every HR value ever computed, for the final summary
+        self.snr_history = []  # every computable SNR value, for the final summary
+        self.disp_history = []          # per-window average median displacement (px)
+        self.norm_motion_history = []   # per-window average normalized motion
+
+    def append_sample(self, rgb, timestamp_seconds=None, mode=None, reason=None,
+                       median_displacement=None, normalized_motion=None):
+        with self._lock:
+            if timestamp_seconds is None:
+                timestamp_seconds = (time.time() - self.start_time) if self.start_time else 0.0
+            self._trace.append(list(rgb))
+            self._timestamps.append(timestamp_seconds)
+            self._mode_log.append(mode)
+            self._reason_log.append(reason)
+            self._disp_log.append(median_displacement)
+            self._norm_motion_log.append(normalized_motion)
+            self._total_appended += 1
+
+            cutoff = timestamp_seconds - self._keep_seconds
+            n_drop = bisect.bisect_left(self._timestamps, cutoff)
+            if n_drop > 0:
+                del self._trace[:n_drop]
+                del self._timestamps[:n_drop]
+                del self._mode_log[:n_drop]
+                del self._reason_log[:n_drop]
+                del self._disp_log[:n_drop]
+                del self._norm_motion_log[:n_drop]
+
+    def n_samples(self):
+        with self._lock:
+            return self._total_appended
+
+    def start(self):
+        self.start_time = time.time()
+        self._thread = threading.Thread(target=self._estimation_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _estimation_loop(self):
+        next_tick = self.start_time + self.start_display_at
+        while not self._stop_event.is_set():
+            now = time.time()
+            wait = next_tick - now
+            if wait > 0:
+                self._stop_event.wait(timeout=min(wait, 0.1))
+                continue
+
+            elapsed_seconds = next_tick - self.start_time
+            window_end_seconds = elapsed_seconds - 1
+            self._process_window(window_end_seconds, elapsed_seconds)
+
+            next_tick += 1.0
+            if next_tick < time.time():
+                next_tick = time.time() + 1.0
+
+    def _process_window(self, window_end_seconds, display_at_seconds):
+        with self._lock:
+            trace_snapshot = list(self._trace)
+            ts_snapshot = list(self._timestamps)
+            mode_snapshot = list(self._mode_log)
+            reason_snapshot = list(self._reason_log)
+            disp_snapshot = list(self._disp_log)
+            norm_motion_snapshot = list(self._norm_motion_log)
+
+        window_start_seconds = max(0.0, window_end_seconds - self.buffer_seconds)
+        start_idx = bisect.bisect_left(ts_snapshot, window_start_seconds)
+        end_idx = bisect.bisect_left(ts_snapshot, window_end_seconds)
+        n = end_idx - start_idx
+        if n < 2:
+            return
+
+        window_rgb = np.array(trace_snapshot[start_idx:end_idx], dtype=float)
+
+        # ===== UNCHANGED: actual achieved sample rate from real timestamps,
+        # fed into the exact same, untouched algorithm functions. =====
+        span = ts_snapshot[end_idx - 1] - ts_snapshot[start_idx]
+        effective_fps = (n - 1) / span if span > 1e-6 else self.framerate
+        self.last_effective_fps = effective_fps
+
+        raw_pulse = pos_algorithm(
+            window_rgb, effective_fps,
+            window_seconds=self.window_seconds,
+            combine_method=self.pos_combine,
+        )
+        pulse = bandpass_filter(raw_pulse, effective_fps, self.low_hz, self.high_hz)
+        hr, freqs, psd = estimate_heart_rate(
+            pulse, effective_fps, self.low_hz, self.high_hz, self.nsegments,
+        )
+        # ===== end unchanged algorithm calls =====
+
+        self.current_hr = hr
+        self.last_pulse_signal = pulse
+        self.last_psd = (freqs, psd)
+        self.hr_history.append(hr)
+
+        # ===== NEW: SNR, computed from the (freqs, psd) that
+        # estimate_heart_rate() already returned above -- no new
+        # frequency analysis, no change to hr/pulse/psd themselves. =====
+        snr_db, target_hz = calculate_snr(
+            freqs, psd, hr, low_hz=self.low_hz, high_hz=self.high_hz,
+            signal_band_hz=self.snr_band_hz,
+            include_harmonic=self.snr_include_harmonic,
+        )
+        self.last_snr_db = snr_db
+        self.last_target_hz = target_hz
+        if snr_db is not None:
+            self.snr_history.append(snr_db)
+
+        # ===== PERFORMANCE DIAGNOSTICS: window-block format, extended with
+        # KLT/ECC breakdown while every original line is kept as-is. =====
+        mode_slice = mode_snapshot[start_idx:end_idx]
+        reason_slice = reason_snapshot[start_idx:end_idx]
+        mediapipe_frames = sum(1 for m in mode_slice if m == "MEDIAPIPE")
+        klt_frames = sum(1 for m in mode_slice if m == "KLT")
+        ecc_frames = sum(1 for m in mode_slice if m == "ECC")
+        mp_pct = (mediapipe_frames / n * 100.0) if n else 0.0
+        klt_pct = (klt_frames / n * 100.0) if n else 0.0
+        ecc_pct = (ecc_frames / n * 100.0) if n else 0.0
+        redetections = sum(1 for r in reason_slice if r not in (None, "INITIAL"))
+        failures = sum(1 for r in reason_slice
+                        if r in ("KLT_FAILURE", "GEOMETRY_REJECTED",
+                                  "ECC_FAILED", "TRACKER_INIT_FAILED"))
+        klt_failures = sum(1 for r in reason_slice if r == "KLT_FAILURE")
+        ecc_activations = ecc_frames  # every ECC-mode sample = one successful ECC activation
+        ecc_failures = sum(1 for r in reason_slice if r == "ECC_FAILED")
+
+        # ===== NEW: median displacement / normalized motion, averaged over
+        # this window (None entries -- MediaPipe-only frames with no motion
+        # measurement -- are excluded from the average). =====
+        disp_slice = [d for d in disp_snapshot[start_idx:end_idx] if d is not None]
+        norm_motion_slice = [m for m in norm_motion_snapshot[start_idx:end_idx] if m is not None]
+        avg_disp = float(np.mean(disp_slice)) if disp_slice else None
+        avg_norm_motion = float(np.mean(norm_motion_slice)) if norm_motion_slice else None
+        if avg_disp is not None:
+            self.disp_history.append(avg_disp)
+        if avg_norm_motion is not None:
+            self.norm_motion_history.append(avg_norm_motion)
+
+        duration = window_end_seconds - window_start_seconds
+        deficit = effective_fps - self.framerate
+        snr_str = f"{snr_db:.1f} dB" if snr_db is not None else "n/a"
+
+        if self.verbose:
+            print("=" * 60)
+            print(f"Window: {window_start_seconds:.1f} - {window_end_seconds:.1f} s")
+            print(f"Duration: {duration:.2f} s")
+            print(f"Samples: {n}")
+            print(f"Nominal FPS: {self.framerate:.2f}")
+            print(f"Actual FPS: {effective_fps:.2f}   (deficit: {deficit:+.2f})")
+            print(f"HR = {hr:.1f} BPM | Target = {target_hz:.3f} Hz | SNR = {snr_str}")
+            print(f"MediaPipe frames: {mediapipe_frames}")
+            print(f"KLT frames: {klt_frames}")
+            print(f"ECC frames: {ecc_frames}")
+            print(f"MediaPipe usage: {mp_pct:.1f}%")
+            print(f"KLT usage: {klt_pct:.1f}%")
+            print(f"ECC usage: {ecc_pct:.1f}%")
+            print(f"Re-detections: {redetections}")
+            print(f"Tracker failures: {failures}")
+            print(f"KLT failures: {klt_failures}")
+            print(f"ECC activations: {ecc_activations}")
+            print(f"ECC failures: {ecc_failures}")
+            disp_str = f"{avg_disp:.2f} px" if avg_disp is not None else "n/a"
+            norm_motion_str = f"{avg_norm_motion * 100.0:.1f}%" if avg_norm_motion is not None else "n/a"
+            print(f"Median landmark displacement: {disp_str}")
+            print(f"Normalized motion: {norm_motion_str}")
+            print("=" * 60)
+
+
+# =============================================================================
+# NEW / ===== TRACKING ARCHITECTURE CHANGE =====
+# Capture layer: camera opening (unchanged from before) and
+# MediaPipe-init + KLT-tracking + ROI-only-ECC-refinement ROI acquisition.
+#
+# Nothing below this point touches build_roi_mask(), mean_skin_rgb(),
+# pos_algorithm(), bandpass_filter(), or estimate_heart_rate().
+# =============================================================================
+
+# --- geometry sanity thresholds (unchanged concept from prior tracker version) --
+TRACK_MAX_CENTER_JUMP_RATIO = 0.5
+TRACK_MIN_SIZE_RATIO = 0.4
+TRACK_MAX_SIZE_RATIO = 2.5
+# -----------------------------------------------------------------------
+
+# ===== KLT (Lucas-Kanade optical flow) parameters =====
+KLT_LK_PARAMS = dict(
+    winSize=(31, 31),
+    maxLevel=4,
+    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+)
+KLT_GFTT_PARAMS = dict(
+    maxCorners=100,
+    qualityLevel=0.01,
+    minDistance=7,
+    blockSize=7,
+)
+KLT_MIN_POINTS = 6  # below this many surviving tracked points, treat as a failure
+KLT_SCALE_CLAMP = (0.5, 2.0)  # sanity clamp on per-frame scale change
+# -----------------------------------------------------------------------
+
+# ===== ECC trigger: normalized_motion = median_point_displacement / ROI_diagonal.
+# NOT a fixed pixel threshold. Default 5% of the ROI diagonal, per spec;
+# overridable per-instance (FaceROITracker(motion_threshold=...)) and via
+# --ecc_motion_threshold on the command line so it can be tuned experimentally. =====
+MOVEMENT_THRESHOLD_RATIO = 0.005
+
+# ===== ECC (per-ROI-patch realignment) parameters =====
+ECC_WARP_MODE = cv2.MOTION_TRANSLATION
+ECC_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 1e-4)
+ECC_MIN_SUCCESS_FRACTION = 0.5  # majority of the 4 ROI patches must converge
+# -----------------------------------------------------------------------
+
+
+def open_camera(camera_index, fourcc="MJPG", no_dshow=False, no_v4l2=False):
+    """Open a live camera.
+
+    IMPORTANT QUIRK this default works around: on Linux, opening via the
+    explicit cv2.CAP_V4L2 backend (needed elsewhere so an explicit FOURCC
+    request actually sticks) WITHOUT also telling it a FOURCC can cause
+    V4L2 to fall back to its own internal default pixel format -- on some
+    driver/webcam combinations that's an UNCOMPRESSED format (e.g. YUYV),
+    not the camera's true native default. The auto/"ANY" backend
+    (cv2.VideoCapture(idx) with no backend flag) would normally have
+    negotiated the camera's real default, typically compressed MJPEG --
+    but forcing V4L2 changes that unless a format is explicitly requested.
+
+    So the default here is now the explicit string "MJPG" (matching
+    almost every USB webcam's actual native compressed format), rather
+    than an empty/unrequested value -- this guarantees compressed
+    capture regardless of what V4L2's own internal fallback would have
+    picked. Pass fourcc="YUYV" (or any other explicit format) to force
+    uncompressed capture instead; pass fourcc="" to skip requesting any
+    format at all (only safe if you also pass no_v4l2=True, since
+    otherwise you're back to the quirk described above).
+
+    Either way, frames are never written to disk or re-encoded by this
+    script -- they're processed directly as arrays from camera.read();
+    any decompression from a compressed format like MJPEG happens
+    transparently inside OpenCV before that.
+    """
+    if sys.platform.startswith("linux") and not no_v4l2:
+        camera = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
+    elif sys.platform.startswith("win") and not no_dshow:
+        camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    else:
+        camera = cv2.VideoCapture(camera_index)
+
+    if fourcc:
+        try:
+            camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+        except Exception as e:
+            print(f"WARNING: could not request FOURCC '{fourcc}' ({e}); "
+                  f"continuing with whatever format the backend falls "
+                  f"back to.")
+
+    return camera
+
+
+def print_negotiated_fourcc(camera, requested_fourcc):
+    """Never assume cap.set(CAP_PROP_FOURCC, ...) succeeded (or was even
+    requested) -- read back and print what the driver is actually
+    delivering. If no format was explicitly requested (requested_fourcc
+    is empty/falsy), this just reports the driver's own default --
+    normally a compressed codec like MJPEG on most webcams -- rather
+    than comparing against a request that was never made."""
+    actual_code = int(camera.get(cv2.CAP_PROP_FOURCC))
+    actual_str = "".join(chr((actual_code >> (8 * i)) & 0xFF) for i in range(4))
+    w = camera.get(cv2.CAP_PROP_FRAME_WIDTH)
+    h = camera.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    if requested_fourcc:
+        match = "OK" if actual_str.upper().rstrip() == requested_fourcc.upper().rstrip() else "DIFFERENT"
+        print(f"Camera negotiated FOURCC='{actual_str}' at {w:.0f}x{h:.0f} "
+              f"(requested '{requested_fourcc}') [{match}]")
+    else:
+        print(f"Camera negotiated FOURCC='{actual_str}' at {w:.0f}x{h:.0f} "
+              f"(no format explicitly requested -- using the camera's own "
+              f"default, typically compressed, e.g. MJPEG)")
+    return actual_str
+
+
+class FaceROITracker:
+    """
+    Flow: MediaPipe init -> ROI definition -> KLT -> (<=10% movement: KLT
+    continues) -> (>10% movement: ROI-only ECC) -> update ROI -> KLT
+    resumes -> MediaPipe recovery only if KLT/ECC cannot maintain the ROI.
+
+    process() returns (mask_or_None, bbox_or_None, mode, reason) where
+    mode is one of "MEDIAPIPE" / "KLT" / "ECC", and reason is one of:
+        None                  -- normal KLT-tracked frame
+        "INITIAL"              -- the very first-ever detection
+        "KLT_FAILURE"          -- fewer than KLT_MIN_POINTS points survived optical flow
+        "GEOMETRY_REJECTED"    -- resulting ROI left the frame / became degenerate
+        "ECC_FAILED"           -- ECC failed to converge on a majority of the 4 ROI patches
+        "TRACKER_INIT_FAILED"  -- after ECC success, re-seeding KLT found too few features
+        "NO_TRACKER_AVAILABLE" -- --tracker none was requested; MediaPipe runs every frame
+    """
+
+    def __init__(self, tracker_kind="klt", max_gap=5, motion_threshold=MOVEMENT_THRESHOLD_RATIO):
+        self.tracker_kind = tracker_kind  # "klt" or None (== --tracker none)
+        self.max_gap = max_gap
+        self.motion_threshold = motion_threshold  # normalized_motion above this -> ECC
+        self.gap_count = 0
+
+        self.last_roi_rects = None      # {name: (x, y, w, h)} -- current rPPG ROI patches
+        self.last_roi_patches = {}      # {name: grayscale crop} -- ECC templates
+
+        # KLT tracking-motion state (tracks a WIDE face-oval point set, see
+        # build_tracking_mask(); this only estimates motion, never selects
+        # which pixels are averaged for the rPPG signal)
+        self.klt_prev_gray = None
+        self.klt_prev_pts = None
+        self.klt_ref_center = None      # centroid of ROI rects at last (re)seed
+        self.klt_ref_size = None        # ROI diagonal (sqrt(w^2+h^2)) at last (re)seed --
+                                         # the "characteristic size of the rPPG ROI" used to
+                                         # normalize median point displacement into normalized_motion
+
+        # ===== PERFORMANCE DIAGNOSTICS counters =====
+        self.redetect_count = 0          # MediaPipe calls after the very first
+        self.mediapipe_frame_count = 0
+        self.klt_frame_count = 0
+        self.ecc_frame_count = 0
+        self.klt_failure_count = 0
+        self.ecc_activation_count = 0
+        self.ecc_failure_count = 0
+
+    # ---- small geometry helpers ----------------------------------------
+
+    @staticmethod
+    def _rects_center(rects):
+        xs, ys = [], []
+        for (x, y, w, h) in rects.values():
+            xs.append(x + w / 2.0)
+            ys.append(y + h / 2.0)
+        return (float(np.mean(xs)), float(np.mean(ys)))
+
+    @staticmethod
+    def _union_bbox(rects, frame_shape):
+        _, bbox = _mask_from_rects(frame_shape, rects)
+        return bbox
+
+    def _rois_in_bounds(self, rects, frame_shape):
+        h, w = frame_shape[:2]
+        for (x, y, rw, rh) in rects.values():
+            if rw <= 0 or rh <= 0:
+                return False
+            if x < 0 or y < 0 or x + rw > w or y + rh > h:
+                return False
+        return True
+
+    @staticmethod
+    def _estimate_scale(old_pts, new_pts):
+        if len(new_pts) < 2:
+            return 1.0
+        old_c = old_pts.mean(axis=0)
+        new_c = new_pts.mean(axis=0)
+        old_spread = float(np.mean(np.linalg.norm(old_pts - old_c, axis=1)))
+        new_spread = float(np.mean(np.linalg.norm(new_pts - new_c, axis=1)))
+        if old_spread <= 1e-3:
+            return 1.0
+        return float(np.clip(new_spread / old_spread, KLT_SCALE_CLAMP[0], KLT_SCALE_CLAMP[1]))
+
+    @staticmethod
+    def _apply_rigid_transform_to_rects(rects, translation, scale, ref_center):
+        """Applies one rigid (translation + uniform scale about ref_center)
+        transform to every ROI rectangle -- assumes the face plane moves
+        ~rigidly between consecutive frames, reasonable for small
+        frame-to-frame motion at ~30 fps."""
+        cx, cy = ref_center
+        ncx, ncy = cx + translation[0], cy + translation[1]
+        new_rects = {}
+        for name, (x, y, w, h) in rects.items():
+            rel_x = (x + w / 2.0 - cx) * scale
+            rel_y = (y + h / 2.0 - cy) * scale
+            new_cx = ncx + rel_x
+            new_cy = ncy + rel_y
+            new_w = w * scale
+            new_h = h * scale
+            new_rects[name] = (new_cx - new_w / 2.0, new_cy - new_h / 2.0, new_w, new_h)
+        return new_rects
+
+    @staticmethod
+    def _select_good_features(gray, mask):
+        pts = cv2.goodFeaturesToTrack(gray, mask=mask, **KLT_GFTT_PARAMS)
+        if pts is None:
+            return None
+        return pts.reshape(-1, 2).astype(np.float32)
+
+    def _update_roi_patch_templates(self, gray, rects):
+        h, w = gray.shape[:2]
+        templates = {}
+        for name, (x, y, rw, rh) in rects.items():
+            x0, y0 = int(round(x)), int(round(y))
+            x1, y1 = int(round(x + rw)), int(round(y + rh))
+            x0c, y0c = max(0, x0), max(0, y0)
+            x1c, y1c = min(w, x1), min(h, y1)
+            if x1c > x0c and y1c > y0c:
+                templates[name] = gray[y0c:y1c, x0c:x1c].copy()
+        self.last_roi_patches = templates
+
+    # ---- ECC: per-ROI-patch realignment only, never whole-frame/face ---
+
+    def _ecc_refine_rois(self, curr_gray, candidate_rects):
+        """Runs cv2.findTransformECC() separately for each of the four ROI
+        patches (never on the whole frame/face): template = last known-good
+        patch pixels, input = a same-size crop of the CURRENT frame at the
+        KLT-predicted candidate location. ECC only estimates a small
+        residual TRANSLATION to correct that location -- it never supplies
+        or alters pixel intensities; the actual rPPG pixels are always
+        re-read fresh from the raw current frame afterward, by the
+        unmodified mean_skin_rgb(). Returns (refined_rects, all_ok)."""
+        h, w = curr_gray.shape[:2]
+        refined = {}
+        ok_count = 0
+        total = 0
+        for name, rect in candidate_rects.items():
+            template = self.last_roi_patches.get(name)
+            if template is None or template.size == 0:
+                refined[name] = rect
+                continue
+            total += 1
+
+            th, tw = template.shape[:2]
+            x, y = int(round(rect[0])), int(round(rect[1]))
+            x0, y0 = max(0, x), max(0, y)
+            x1, y1 = min(w, x + tw), min(h, y + th)
+            if x1 - x0 < 4 or y1 - y0 < 4:
+                refined[name] = rect  # too close to frame edge to attempt ECC
+                continue
+            candidate_crop = curr_gray[y0:y1, x0:x1]
+
+            if candidate_crop.shape != template.shape:
+                tmpl = cv2.resize(template, (candidate_crop.shape[1], candidate_crop.shape[0]))
+            else:
+                tmpl = template
+
+            try:
+                warp_matrix = np.eye(2, 3, dtype=np.float32)
+                tmpl_f = tmpl.astype(np.float32)
+                cand_f = candidate_crop.astype(np.float32)
+                _cc, warp_matrix = cv2.findTransformECC(
+                    tmpl_f, cand_f, warp_matrix, ECC_WARP_MODE, ECC_CRITERIA)
+                dx, dy = float(warp_matrix[0, 2]), float(warp_matrix[1, 2])
+                refined[name] = (x0 + dx, y0 + dy, rect[2], rect[3])
+                ok_count += 1
+            except cv2.error:
+                refined[name] = rect  # keep KLT's candidate position for this patch
+
+        all_ok = total > 0 and ok_count >= max(1, int(np.ceil(total * ECC_MIN_SUCCESS_FRACTION)))
+        return refined, all_ok
+
+    # ---- MediaPipe: initial detection + genuine recovery ----------------
+
+    def _run_mediapipe_detection(self, frame, landmarker, timestamp_ms, reason, gray=None):
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        result = landmarker.detect_for_video(mp_image, timestamp_ms)
+        was_redetect = reason != "INITIAL"
+
+        if gray is None:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if not result.face_landmarks:
+            self.gap_count += 1
+            self.mediapipe_frame_count += 1
+            if self.last_roi_rects is not None and self.gap_count <= self.max_gap:
+                mask, bbox = _mask_from_rects(frame.shape, self.last_roi_rects)
+                return mask, bbox, "MEDIAPIPE", reason, None, None
+            return None, None, "MEDIAPIPE", reason, None, None
+
+        landmarks_px = landmarks_to_pixels(result.face_landmarks[0], frame.shape)
+        mask, bbox = build_roi_mask(frame.shape, landmarks_px)  # UNCHANGED signature/semantics
+        roi_rects = compute_roi_rects(frame.shape, landmarks_px)
+
+        if was_redetect:
+            self.redetect_count += 1
+        self.last_roi_rects = roi_rects
+        self._update_roi_patch_templates(gray, roi_rects)
+        self.gap_count = 0
+        self.mediapipe_frame_count += 1
+
+        # (Re)seed KLT from the WIDE face-oval tracking mask -- available
+        # here because we just got fresh landmarks. Tracking-only; never
+        # affects which pixels feed POS (that's always `mask`/roi_rects).
+        self.klt_prev_pts = None
+        self.klt_prev_gray = None
+        if self.tracker_kind is not None:
+            tracking_mask = build_tracking_mask(frame.shape, landmarks_px)
+            pts = self._select_good_features(gray, tracking_mask)
+            if pts is not None and len(pts) >= KLT_MIN_POINTS:
+                self.klt_prev_gray = gray
+                self.klt_prev_pts = pts
+                self.klt_ref_center = self._rects_center(roi_rects)
+                bx, by, bw, bh = bbox
+                self.klt_ref_size = max(float(np.hypot(bw, bh)), 1.0)  # ROI diagonal
+            else:
+                n_found = 0 if pts is None else len(pts)
+                print(f"WARNING: KLT found only {n_found} trackable feature(s) "
+                      f"(< {KLT_MIN_POINTS}); will retry detection next frame.")
+
+        return mask, bbox, "MEDIAPIPE", reason, None, None
+
+    # ---- main per-frame entry point --------------------------------------
+
+    def process(self, frame, landmarker, timestamp_ms):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if self.klt_prev_pts is None:
+            if self.last_roi_rects is None:
+                reason = "INITIAL"
+            elif self.tracker_kind is None:
+                reason = "NO_TRACKER_AVAILABLE"
+            else:
+                reason = "TRACKER_INIT_FAILED"
+            return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, reason, gray)
+
+        try:
+            new_pts_raw, status, _err = cv2.calcOpticalFlowPyrLK(
+                self.klt_prev_gray, gray,
+                self.klt_prev_pts.reshape(-1, 1, 2),
+                None, **KLT_LK_PARAMS,
+            )
+        except Exception as e:
+            print(f"WARNING: calcOpticalFlowPyrLK raised {e!r}; treating as "
+                  f"a tracking failure (this frame only -- tracking will "
+                  f"retry after MediaPipe recovers).")
+            new_pts_raw, status = None, None
+
+        if status is None or new_pts_raw is None:
+            valid_new = np.empty((0, 2), dtype=np.float32)
+            valid_old = np.empty((0, 2), dtype=np.float32)
+        else:
+            status = status.reshape(-1)
+            valid_old = self.klt_prev_pts[status == 1]
+            valid_new = new_pts_raw.reshape(-1, 2)[status == 1]
+
+        if len(valid_new) < KLT_MIN_POINTS:
+            self.klt_failure_count += 1
+            self.klt_prev_pts = None
+            self.klt_prev_gray = None
+            return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, "KLT_FAILURE", gray)
+
+        # ===== ECC trigger metric, per spec =====
+        # median DISPLACEMENT MAGNITUDE of the valid tracked points (not the
+        # median of the translation vector's components) -- a few points
+        # jumping due to bad optical flow can't skew this the way a mean
+        # would, since the median is robust to outliers.
+        point_displacements = np.linalg.norm(valid_new - valid_old, axis=1)
+        median_displacement = float(np.median(point_displacements))
+        roi_diagonal = max(self.klt_ref_size or 1.0, 1.0)
+        normalized_motion = median_displacement / roi_diagonal
+
+        # translation vector (still needed to actually move the ROI rects --
+        # a separate concern from the scalar trigger metric above)
+        translation = np.median(valid_new - valid_old, axis=0)
+        scale = self._estimate_scale(valid_old, valid_new)
+
+        candidate_rects = self._apply_rigid_transform_to_rects(
+            self.last_roi_rects, translation, scale, self.klt_ref_center)
+
+        if normalized_motion <= self.motion_threshold:
+            # ---- normal path: <=10% movement, accept KLT directly ----
+            if not self._rois_in_bounds(candidate_rects, frame.shape):
+                self.klt_failure_count += 1
+                self.klt_prev_pts = None
+                self.klt_prev_gray = None
+                return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, "GEOMETRY_REJECTED", gray)
+
+            self.last_roi_rects = candidate_rects
+            self._update_roi_patch_templates(gray, candidate_rects)
+            self.klt_prev_gray = gray
+            self.klt_prev_pts = valid_new.astype(np.float32)
+            self.klt_ref_center = self._rects_center(candidate_rects)
+            self.klt_frame_count += 1
+            mask, bbox = _mask_from_rects(frame.shape, candidate_rects)
+            return mask, bbox, "KLT", None, median_displacement, normalized_motion
+
+        # ---- movement > 10%: ROI-only ECC realignment (never MediaPipe yet) ----
+        refined_rects, ecc_ok = self._ecc_refine_rois(gray, candidate_rects)
+        if not ecc_ok:
+            self.ecc_failure_count += 1
+            self.klt_prev_pts = None
+            self.klt_prev_gray = None
+            return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, "ECC_FAILED", gray)
+
+        self.ecc_activation_count += 1
+
+        if not self._rois_in_bounds(refined_rects, frame.shape):
+            self.ecc_failure_count += 1
+            self.klt_prev_pts = None
+            self.klt_prev_gray = None
+            return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, "GEOMETRY_REJECTED", gray)
+
+        self.last_roi_rects = refined_rects
+        self._update_roi_patch_templates(gray, refined_rects)
+
+        # re-seed KLT from the (small) union of the refined ROI patches --
+        # no fresh landmarks are available here since MediaPipe did not run,
+        # so the wide face-oval tracking mask isn't available; this is the
+        # accepted tradeoff for avoiding an unnecessary MediaPipe call.
+        roi_tracking_mask, _ = _mask_from_rects(frame.shape, refined_rects)
+        pts = self._select_good_features(gray, roi_tracking_mask)
+        if pts is None or len(pts) < KLT_MIN_POINTS:
+            self.klt_prev_pts = None
+            self.klt_prev_gray = None
+            return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, "TRACKER_INIT_FAILED", gray)
+
+        self.klt_prev_gray = gray
+        self.klt_prev_pts = pts
+        self.klt_ref_center = self._rects_center(refined_rects)
+        self.ecc_frame_count += 1
+        mask, bbox = _mask_from_rects(frame.shape, refined_rects)
+        return mask, bbox, "ECC", None, median_displacement, normalized_motion
+
+
+def process_single_frame(frame, roi_tracker, landmarker, timestamp_ms,
+                          use_color_skin_mask=True, image_show=False):
+    """Per-frame ROI acquisition (via roi_tracker) followed by the
+    UNCHANGED mean_skin_rgb() call -- whichever mechanism (MediaPipe/KLT/
+    ECC) supplied the ROI this frame, the actual pixel values are always
+    read fresh from the raw current frame here.
+
+    Returns (rgb_or_None, mode: str, reason: str_or_None,
+             median_displacement: float_or_None, normalized_motion: float_or_None).
+    """
+    mask, bbox, mode, reason, median_displacement, normalized_motion = \
+        roi_tracker.process(frame, landmarker, timestamp_ms)
+
+    rgb = None
+    if mask is not None and bbox is not None:
+        bx, by, bw, bh = bbox
+        if bw > 0 and bh > 0:
+            face_crop = frame[by:by + bh, bx:bx + bw]
+            mask_crop = mask[by:by + bh, bx:bx + bw]
+            if face_crop.size > 0:
+                rgb = mean_skin_rgb(face_crop, mask_crop, use_color_skin_mask)  # UNCHANGED
+            if image_show:
+                color = {"MEDIAPIPE": (0, 255, 0), "KLT": (255, 200, 0), "ECC": (255, 0, 255)}.get(mode, (0, 0, 255))
+                cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), color, 2)
+
+    return rgb, mode, reason, median_displacement, normalized_motion
+
+
+def _gui_available():
+    try:
+        cv2.namedWindow("__gui_probe__", cv2.WINDOW_NORMAL)
+        cv2.destroyWindow("__gui_probe__")
+        return True
+    except cv2.error:
+        return False
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-v", "--video",
+                     help="optional video file to stream instead of a live "
+                          "camera (paced to real time via sleep)")
+    ap.add_argument("--camera_index", type=int, default=0,
+                     help="camera device index to use when --video is not given")
+    ap.add_argument("--framerate", type=float, default=30.0,
+                     help="nominal capture framerate; fallback only -- real "
+                          "elapsed time is what actually drives the HR math")
+    ap.add_argument("--face_model", default="face_landmarker.task")
+    ap.add_argument("--no_color_skin_mask", action="store_true")
+    ap.add_argument("--window_seconds", type=float, default=1.6,
+                     help="POS sliding-window length in seconds (paper default 1.6s)")
+    ap.add_argument("--pos_combine", choices=["alpha", "svd"], default="alpha")
+    ap.add_argument("--low_hz", type=float, default=0.7)
+    ap.add_argument("--high_hz", type=float, default=3.5)
+    ap.add_argument("--max_gap", type=int, default=5,
+                     help="max consecutive frames with no usable ROI before "
+                          "giving up on reusing the last known ROI")
+    ap.add_argument("--nsegments", type=int, default=12)
+    ap.add_argument("--snr_band_hz", type=float, default=0.2,
+                     help="half-width (Hz) of the SNR signal band around "
+                          "the estimated HR frequency (and its harmonic, "
+                          "if included). Default ±0.2 Hz, matching the "
+                          "standard rPPG SNR literature convention "
+                          "(de Haan & Jeanne 2013 / Poh et al. 2010).")
+    ap.add_argument("--snr_no_harmonic", action="store_true",
+                     help="exclude the HR's 2nd harmonic (2x the pulse "
+                          "frequency) from the SNR signal power -- by "
+                          "default it IS included (matching the standard "
+                          "rPPG SNR formula, which treats fundamental + "
+                          "first harmonic as signal), when that harmonic "
+                          "falls inside [--low_hz, --high_hz].")
+    ap.add_argument("--start_display_at", type=float, default=11.0,
+                     help="second at which the first HR value is computed/shown")
+    ap.add_argument("--buffer_seconds", type=float, default=10.0,
+                     help="width of the rolling window in seconds (default 10s)")
+    ap.add_argument("--image_show", action="store_true",
+                     help="show a live window with the camera feed and HR overlay")
+    ap.add_argument("--fourcc", default="MJPG",
+                     help="pixel format to explicitly request from the "
+                          "camera. Default 'MJPG' -- the camera's normal "
+                          "compressed format on almost all USB webcams. "
+                          "(Left unrequested, forcing the V4L2/DirectShow "
+                          "backend used elsewhere for reliable FOURCC "
+                          "control can itself cause an uncompressed "
+                          "fallback on some drivers -- explicitly asking "
+                          "for MJPG avoids that.) Pass e.g. YUYV to force "
+                          "uncompressed capture instead, or '' to request "
+                          "nothing at all.")
+    ap.add_argument("--no_dshow", action="store_true",
+                     help="on Windows, don't force the DirectShow backend")
+    ap.add_argument("--no_v4l2", action="store_true",
+                     help="on Linux, don't force the V4L2 backend")
+    ap.add_argument("--tracker", choices=["klt", "none"], default="klt",
+                     help="tracking mechanism used between MediaPipe "
+                          "detections: KLT normal tracking, escalating to "
+                          "ROI-only ECC realignment when normalized motion "
+                          "(median tracked-point displacement / ROI "
+                          "diagonal) exceeds --ecc_motion_threshold, with "
+                          "MediaPipe recovery only if both fail. 'none' "
+                          "disables tracking and runs MediaPipe on every "
+                          "frame.")
+    ap.add_argument("--ecc_motion_threshold", type=float, default=MOVEMENT_THRESHOLD_RATIO,
+                     help="normalized-motion threshold (median tracked-point "
+                          "displacement / ROI diagonal) above which ROI-only "
+                          "ECC realignment is triggered instead of continuing "
+                          "plain KLT. Default 0.05 (5%% of the ROI diagonal); "
+                          "tune experimentally.")
+    ap.add_argument("--verbose_frames", action="store_true",
+                     help="print a diagnostic line for every single frame "
+                          "(frame number, elapsed time, fps, mode, and, on "
+                          "re-detect frames, the reason + recovery result). "
+                          "Off by default -- the per-10s-window block below "
+                          "is the primary output.")
+    args = ap.parse_args()
+
+    if args.video:
+        camera = cv2.VideoCapture(1)
+        is_file = True
+    else:
+        camera = open_camera(1, fourcc=args.fourcc,
+                              no_dshow=args.no_dshow, no_v4l2=args.no_v4l2)
+        is_file = False
+    if not camera.isOpened():
+        raise RuntimeError("Cannot open video source.")
+
+    if not is_file:
+        print_negotiated_fourcc(camera, args.fourcc)
+    else:
+        # ===== §19 video-file behavior: don't confuse video FPS with
+        # actual processing FPS -- state the pacing explicitly. =====
+        print(f"Processing video file '{args.video}', paced to real time via "
+              f"sleep so the same 1s-per-window HR schedule applies as a "
+              f"live camera would get. --framerate is only the pacing "
+              f"target; actual FPS used for the HR math is measured from "
+              f"real timestamps, same as with a live camera.")
+
+    model_path = ensure_face_landmarker_model(args.face_model)
+    landmarker = build_face_landmarker(model_path)
+
+    tracker_kind = None if args.tracker == "none" else args.tracker
+    if tracker_kind is not None:
+        print(f"OpenCV version: {cv2.__version__}")
+        print("Tracking architecture: MediaPipe init -> KLT -> "
+              f"(normalized motion > {args.ecc_motion_threshold * 100:.1f}% of "
+              "ROI diagonal: ROI-only ECC) -> KLT resumes -> MediaPipe "
+              "recovery only if necessary. (cv2.calcOpticalFlowPyrLK / "
+              "cv2.findTransformECC ship with core opencv-python, no "
+              "opencv-contrib-python required.)")
+
+    tracker_label = "KLT+ECC" if tracker_kind else "NONE"
+    print(f"Tracker: {tracker_label}")
+
+    roi_tracker = FaceROITracker(tracker_kind=tracker_kind, max_gap=args.max_gap,
+                                  motion_threshold=args.ecc_motion_threshold)
+
+    monitor = RealTimeHeartRateMonitor(
+        framerate=args.framerate,
+        start_display_at=args.start_display_at,
+        buffer_seconds=args.buffer_seconds,
+        window_seconds=args.window_seconds,
+        pos_combine=args.pos_combine,
+        low_hz=args.low_hz,
+        high_hz=args.high_hz,
+        nsegments=args.nsegments,
+        snr_band_hz=args.snr_band_hz,
+        snr_include_harmonic=not args.snr_no_harmonic,
+    )
+
+    last_timestamp_ms = -1
+    frame_number = 0
+    frame_interval = 1.0 / args.framerate
+    recent_frame_times = []
+    FPS_WINDOW = 15
+
+    image_show = args.image_show
+    if image_show and not _gui_available():
+        print("WARNING: --image_show was requested but this OpenCV build "
+              "has no GUI backend. Falling back to console-only output.")
+        image_show = False
+
+    print(f"Streaming... collecting baseline for {args.start_display_at:.0f}s "
+          f"before the first HR estimate is shown.")
+
+    monitor.start()
+    try:
+        while True:
+            loop_start = time.time()
+
+            grabbed, frame = camera.read()
+            if not grabbed:
+                print("End of stream / camera read failed.")
+                break
+
+            timestamp_ms = int(round((time.time() - monitor.start_time) * 1000.0))
+            if timestamp_ms <= last_timestamp_ms:
+                timestamp_ms = last_timestamp_ms + 1
+            last_timestamp_ms = timestamp_ms
+
+            rgb, mode, reason, median_displacement, normalized_motion = process_single_frame(
+                frame, roi_tracker, landmarker, timestamp_ms,
+                use_color_skin_mask=not args.no_color_skin_mask,
+                image_show=image_show,
+            )
+
+            if rgb is None:
+                if monitor.n_samples() > 0:
+                    with monitor._lock:
+                        rgb = tuple(monitor._trace[-1])
+
+            if rgb is not None:
+                monitor.append_sample(rgb, mode=mode, reason=reason,
+                                       median_displacement=median_displacement,
+                                       normalized_motion=normalized_motion)
+
+            frame_number += 1
+            recent_frame_times.append(loop_start)
+            if len(recent_frame_times) > FPS_WINDOW:
+                recent_frame_times.pop(0)
+            if len(recent_frame_times) >= 2:
+                span = recent_frame_times[-1] - recent_frame_times[0]
+                current_fps = (len(recent_frame_times) - 1) / span if span > 1e-6 else 0.0
+            else:
+                current_fps = 0.0
+
+            # ===== PERFORMANCE DIAGNOSTICS: per-frame verbose format =====
+            mode_str = mode if mode else "MEDIAPIPE"
+            if args.verbose_frames:
+                elapsed_total = time.time() - monitor.start_time
+                print(f"frame={frame_number:<6d} time={elapsed_total:6.2f}s   "
+                      f"fps={current_fps:5.1f}   mode={mode_str}")
+                if reason not in (None, "INITIAL"):
+                    recovered = roi_tracker.klt_prev_pts is not None
+                    print(f"          reason={reason}  "
+                          f"recovery={'SUCCESS' if recovered else 'FAILED'}")
+
+            if image_show:
+                elapsed = time.time() - monitor.start_time
+                if monitor.current_hr is not None:
+                    label = f"HR: {monitor.current_hr:.1f} bpm  [{mode_str}]"
+                    color = (0, 255, 0)
+                else:
+                    remaining = max(0.0, args.start_display_at - elapsed)
+                    label = f"Collecting baseline... {remaining:.1f}s  [{mode_str}]"
+                    color = (0, 165, 255)
+                cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.9, color, 2, cv2.LINE_AA)
+                try:
+                    cv2.imshow("Real-time rPPG", frame)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+                except cv2.error as e:
+                    print(f"WARNING: display window failed ({e}); "
+                          f"continuing in console-only mode.")
+                    image_show = False
+
+            if is_file:
+                elapsed_loop = time.time() - loop_start
+                sleep_left = frame_interval - elapsed_loop
+                if sleep_left > 0:
+                    time.sleep(sleep_left)
+    except KeyboardInterrupt:
+        print("Interrupted by user.")
+    finally:
+        monitor.stop()
+        camera.release()
+        landmarker.close()
+        if image_show:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
+
+    # ===== PERFORMANCE DIAGNOSTICS: final performance summary, extended
+    # with the requested KLT/ECC/MediaPipe re-detection breakdown, every
+    # original line kept. =====
+    total_duration = (time.time() - monitor.start_time) if monitor.start_time else 0.0
+    avg_actual_fps = frame_number / total_duration if total_duration > 1e-6 else 0.0
+    mp_total = roi_tracker.mediapipe_frame_count
+    klt_total = roi_tracker.klt_frame_count
+    ecc_total = roi_tracker.ecc_frame_count
+    total_for_pct = mp_total + klt_total + ecc_total
+    mp_pct = (mp_total / total_for_pct * 100.0) if total_for_pct else 0.0
+    klt_pct = (klt_total / total_for_pct * 100.0) if total_for_pct else 0.0
+    ecc_pct = (ecc_total / total_for_pct * 100.0) if total_for_pct else 0.0
+    avg_hr = statistics.mean(monitor.hr_history) if monitor.hr_history else None
+    avg_snr = statistics.mean(monitor.snr_history) if monitor.snr_history else None
+
+    print("================= FINAL PERFORMANCE =================")
+    print(f"Total frames:               {frame_number}")
+    print(f"Total duration:             {total_duration:.2f} s")
+    print(f"Average actual FPS:         {avg_actual_fps:.2f}")
+    print(f"Nominal FPS:                {args.framerate:.2f}")
+    print()
+    print(f"MediaPipe frames:           {mp_total}")
+    print(f"KLT frames:                 {klt_total}")
+    print(f"ECC frames:                 {ecc_total}")
+    print()
+    print(f"MediaPipe usage:            {mp_pct:.1f} %")
+    print(f"KLT usage:                  {klt_pct:.1f} %")
+    print(f"ECC usage:                  {ecc_pct:.1f} %")
+    print()
+    print(f"MediaPipe re-detections:    {roi_tracker.redetect_count}")
+    print(f"KLT failures:               {roi_tracker.klt_failure_count}")
+    print(f"ECC activations:            {roi_tracker.ecc_activation_count}")
+    print(f"ECC failures:               {roi_tracker.ecc_failure_count}")
+    print()
+    avg_disp_all = statistics.mean(monitor.disp_history) if monitor.disp_history else None
+    avg_norm_motion_all = statistics.mean(monitor.norm_motion_history) if monitor.norm_motion_history else None
+    print(f"Avg median displacement:    "
+          f"{avg_disp_all:.2f} px" if avg_disp_all is not None else "Avg median displacement:    n/a")
+    print(f"Avg normalized motion:      "
+          f"{avg_norm_motion_all * 100.0:.1f} %" if avg_norm_motion_all is not None else "Avg normalized motion:      n/a")
+    print()
+    print(f"Average HR:                 "
+          f"{avg_hr:.2f} BPM" if avg_hr is not None else "Average HR:                 n/a")
+    print(f"Average SNR:                "
+          f"{avg_snr:.1f} dB" if avg_snr is not None else "Average SNR:                n/a")
+    print("=======================================================")
+
+    if monitor.current_hr is not None:
+        print(f"Final displayed heart rate: {monitor.current_hr:.2f} bpm")
+    else:
+        print("Stream ended before the first HR estimate could be computed "
+              f"(needs >= {args.start_display_at:.0f}s of footage with a "
+              "detected face).")
+
+
+if __name__ == "__main__":
+    main()
