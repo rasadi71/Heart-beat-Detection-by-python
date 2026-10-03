@@ -18,15 +18,17 @@ now:
     frame) -> ORB descriptor matching (previous frame vs current frame)
     -> RANSAC outlier rejection (cv2.estimateAffinePartial2D) -> dominant
     motion from RANSAC inliers -> normalized_motion = median inlier
-    displacement / ROI diagonal -> motion-threshold decision -> ...
+    displacement / ROI diagonal -> motion-threshold decision -> update ROI
+    coordinates -> extract ORIGINAL raw RGB pixels at the new ROI -> POS.
 
   - MediaPipe runs only for the INITIAL detection and for genuine
     RECOVERY: too few ORB keypoints/matches, RANSAC failing to fit a
-    model or having too few inliers, or the resulting tracked position
-    leaving the frame. It is never triggered merely because
+    model or having too few inliers, or the resulting ROI leaving the
+    frame (and, ADDED, only after the global ORB passport recovery below
+    has also failed). It is never triggered merely because
     normalized_motion is above the threshold.
   - ORB (cv2.ORB_create) detects+describes keypoints inside a rectangle
-    expanded around the last known tracked position (ORB_SEARCH_PADDING_RATIO),
+    expanded around the last known ROI location (ORB_SEARCH_PADDING_RATIO),
     never the whole frame/face -- this is a MOTION-ESTIMATION region only,
     entirely separate from the four physiological ROI patches that
     mean_skin_rgb() reads pixels from. ORB features never select rPPG
@@ -42,77 +44,77 @@ now:
     (sqrt(w^2+h^2) of the union of the four ROI patches, fixed at the
     last MediaPipe (re)detection until the next one):
         normalized_motion = median(||curr_inlier - prev_inlier||) / roi_diagonal
-
-# ===== UPDATE: ROI-FOLLOWING -> FIXED-ROI FRAME ALIGNMENT =====
-# The paragraph below this one (kept for history) describes the
-# PREVIOUS behavior -- ROI coordinates updated algebraically, RGB frame
-# never warped. That behavior has been REPLACED. The four physiological
-# ROI patches (forehead / left cheek / right cheek / chin) no longer
-# move.
-#
-# On the first successful MediaPipe detection, and on every genuine
-# MediaPipe recovery, the ROI rectangles are frozen as `reference_rois`
-# and the frame at that moment becomes the implicit reference coordinate
-# system.
-#
-# ORB + RANSAC still estimate frame-to-frame motion exactly as before
-# (previous frame's keypoints vs current frame's keypoints -> RANSAC
-# similarity transform, previous -> current). That per-frame transform
-# is additionally composed into a running current-frame -> reference-
-# frame transform (`to_reference_transform`), using the mathematically
-# correct INVERSE of each per-frame RANSAC transform (RANSAC estimates
-# previous -> current; alignment needs current -> reference, i.e. the
-# inverse chained back through every prior frame since the reference was
-# established).
-#
-#   normalized_motion <= MOTION_THRESHOLD  (SMALL motion)
-#       -> no warp; the fixed reference ROI is read directly from the
-#          raw current frame (misalignment at this scale is treated as
-#          negligible).
-#   normalized_motion >  MOTION_THRESHOLD  (LARGE motion), and the
-#   RANSAC estimate passes the existing reliability checks
-#       -> cv2.warpAffine(current_frame, to_reference_transform,
-#          flags=cv2.INTER_NEAREST) aligns the CURRENT RGB frame into
-#          the reference coordinate system; the fixed reference ROI is
-#          then read from that aligned frame.
-#
-# Either way, mean_skin_rgb() always reads pixels at the ROI's ORIGINAL,
-# unmoving reference coordinates, from a frame that is either already
-# the reference frame or has been warped into the reference frame's
-# coordinate system. `last_roi_rects` / `last_roi_bbox` inside
-# FaceROITracker still move frame-to-frame, but ONLY to tell ORB where
-# to search for keypoints next frame -- they are no longer used to
-# decide which pixels feed mean_skin_rgb().
-# =============================================================================
-
-  - normalized_motion <= MOTION_THRESHOLD -> [PREVIOUS BEHAVIOR, REPLACED
-    ABOVE] accept the RANSAC-estimated translation+scale directly and
-    update the ROI coordinates.
+  - normalized_motion <= MOTION_THRESHOLD (a fraction of the ROI diagonal;
+    NOT a fixed pixel count) -> accept the RANSAC-estimated transform
+    directly and update the ROI coordinates.
   - normalized_motion > MOTION_THRESHOLD -> the same transform is only
     accepted if RANSAC found enough inliers to trust it at this larger
     scale (MIN_RANSAC_INLIERS_LARGE_MOTION, stricter than the normal-
-    motion minimum) AND the resulting tracked position stays in bounds;
-    otherwise this triggers MediaPipe recovery. This is the "extra
-    validation for large motion" -- RANSAC's own inlier count is the
-    confidence signal, no separate mechanism is introduced.
-  - [PREVIOUS BEHAVIOR, REPLACED ABOVE] ROI coordinates were updated
-    algebraically (translate + scale the rectangle) -- the RGB frame
-    itself was never warped, remapped, or interpolated. This has been
-    replaced by fixed-ROI frame alignment as described above.
+    motion minimum) AND the resulting ROI stays in bounds; otherwise
+    this triggers recovery. This is the "extra validation for large
+    motion" -- RANSAC's own inlier count is the confidence signal, no
+    separate mechanism is introduced.
+  - ROI coordinates are updated algebraically (transform the rectangle) --
+    the RGB frame itself is NEVER warped, remapped, or interpolated. After
+    the ROI moves, pixels are re-read fresh from the raw current frame by
+    the unmodified mean_skin_rgb().
 
-Whichever mechanism supplied the current frame's aligned/raw frame
-(MediaPipe or ORB), the actual rPPG pixel values are always read fresh
-from that frame at the fixed reference ROI location -- never from a
-ROI rectangle that followed the face.
+Whichever mechanism supplied the current frame's ROI (MediaPipe or ORB),
+the actual rPPG pixel values are always read fresh, unmodified, from the
+raw current frame at the final ROI location.
+
+# ===== ADDED: motion/ROI robustness pass (integrated from the aligned
+# variant of this script; the ROI-FOLLOWING approach above stays the base) =====
+#   1. Spatially distributed ORB: keypoints are bucketed into a 4x4 grid
+#      over the existing search region (top-N per cell) so they can't
+#      cluster in one spot. (The grid is ONLY for ORB keypoints -- it is
+#      NOT the physiological ROI.)
+#   2. A facial dynamic-zone mask (from MediaPipe landmarks) keeps ORB
+#      keypoints off the eyes/eyebrows/lips and prefers forehead/nose/
+#      cheek/jaw.
+#   3. Reference-coordinate ROI following: the four physiological patches
+#      are frozen at each MediaPipe (re)detection as `reference_rois`, and
+#      one cumulative REFERENCE -> CURRENT similarity transform is chained
+#      from each per-frame RANSAC transform. The ROI rectangles for the
+#      current frame are ALWAYS computed as  reference_rois mapped through
+#      that single transform, so (a) every patch keeps its exact relative
+#      position/size on the face, (b) per-frame errors are not compounded
+#      by repeatedly re-deriving rectangles from rectangles, and (c) the
+#      SAME transform is used for small and large motion. The frame is
+#      never warped, so there is no double compensation.
+#   4. Per-patch physiological-ROI quality monitoring: unreliable patches
+#      (out of frame / mostly non-skin) are excluded from the mask handed
+#      to the unchanged mean_skin_rgb(), falling back to the original
+#      four-patch union if every patch looks unreliable.
+#   5. A global ORB "reference passport": a bounded set of descriptors
+#      captured once per MediaPipe (re)detection, used ONLY as a recovery
+#      path when local ORB tracking fails, before MediaPipe recovery.
+# None of this changes POS, filtering, HR estimation, SNR, or the four
+# physiological ROI's geometry.
+#
+# ===== ADDED: KLT frame-to-frame tracking layer (on top of ORB + RANSAC) =====
+#   KLT (cv2.calcOpticalFlowPyrLK) = fast frame-to-frame propagation of the
+#       previous ORB keypoints (the 4x4-grid, dynamic-zone-masked set).
+#   ORB descriptors = appearance validation of every tracked point
+#       (Hamming distance + ambiguity ratio test); KLT is never trusted alone.
+#   RANSAC (the existing cv2.estimateAffinePartial2D similarity fit) = the
+#       geometric outlier rejection + motion estimate, followed by the
+#       unchanged reference->current transform chaining (T_new = M @ T_old).
+# If KLT/validation yields too few correspondences, the pre-existing
+# detect-ORB-and-match path is used for that frame, then the passport, then
+# MediaPipe (all unchanged). ORB re-detection is only run when the surviving
+# track count drops below KLT_REDETECT_RATIO of the count at the last
+# (re)detection.
+# ===============================================================
 
 # ===== PERFORMANCE DIAGNOSTICS =====
 The 10-second-window summary keeps the original format and reports:
 MediaPipe/ORB frames & usage %, MediaPipe re-detections, ORB failures,
 RANSAC failures, valid ORB matches, RANSAC inliers, median displacement,
 normalized motion, motion classification (SMALL/LARGE), actual FPS, HR,
-SNR, and now alignment_applied (frames where the current frame was
-actually warped back into the reference coordinate system). All old
-KLT/ECC-specific statistics have been removed.
+SNR. All old KLT/ECC-specific statistics have been removed. The SMALL/LARGE
+classification now uses the SAME per-frame comparison and the SAME
+MOTION_THRESHOLD as the tracker's own decision.
 
 Requires: pip install mediapipe opencv-python scipy numpy
 (ORB and estimateAffinePartial2D both ship in core opencv-python --
@@ -150,6 +152,15 @@ FACE_LANDMARKER_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
     "face_landmarker/float16/1/face_landmarker.task"
 )
+
+# ===== the single motion-decision threshold. normalized_motion = median
+# RANSAC-inlier displacement magnitude / ROI diagonal -- NOT a fixed
+# pixel count. Tunable via FaceROITracker(motion_threshold=...) /
+# --motion_threshold on the command line. It is defined HERE (above every
+# class that needs it) so the tracker, the monitor's SMALL/LARGE
+# diagnostic, and the CLI default all reuse this ONE value. Value left
+# exactly as it was in the base script (0.0015 = 0.15%). =====
+MOTION_THRESHOLD = 0.0015
 
 
 def ensure_face_landmarker_model(model_path):
@@ -502,7 +513,7 @@ class RealTimeHeartRateMonitor:
                  window_seconds=1.6, pos_combine="alpha", low_hz=0.7,
                  high_hz=3.5, nsegments=12, verbose=True,
                  snr_band_hz=0.2, snr_include_harmonic=True,
-                 motion_threshold=0.02):
+                 motion_threshold=MOTION_THRESHOLD):
         self.framerate = framerate  # nominal fallback only, see class docstring
         self.start_display_at = start_display_at
         self.buffer_seconds = buffer_seconds
@@ -525,9 +536,6 @@ class RealTimeHeartRateMonitor:
         self._n_matches_log = []     # parallel: valid ORB matches this frame, or None
         self._n_inliers_log = []     # parallel: RANSAC inliers this frame, or None
         self._inlier_ratio_log = []  # parallel: n_inliers/n_matches this frame, or None
-        self._alignment_log = []     # NEW: parallel, True/False/None -- was the current
-                                      # frame actually warped back into the reference
-                                      # coordinate system this sample?
         self._total_appended = 0
         self._keep_seconds = buffer_seconds + 2.0
         self._lock = threading.Lock()
@@ -548,12 +556,10 @@ class RealTimeHeartRateMonitor:
         self.n_matches_history = []     # per-window average valid ORB matches
         self.n_inliers_history = []     # per-window average RANSAC inliers
         self.inlier_ratio_history = []  # per-window average RANSAC inlier ratio
-        self.alignment_history = []     # NEW: per-window fraction of frames aligned
 
     def append_sample(self, rgb, timestamp_seconds=None, mode=None, reason=None,
                        median_displacement=None, normalized_motion=None,
-                       n_matches=None, n_inliers=None, inlier_ratio=None,
-                       alignment_applied=None):
+                       n_matches=None, n_inliers=None, inlier_ratio=None):
         with self._lock:
             if timestamp_seconds is None:
                 timestamp_seconds = (time.time() - self.start_time) if self.start_time else 0.0
@@ -566,7 +572,6 @@ class RealTimeHeartRateMonitor:
             self._n_matches_log.append(n_matches)
             self._n_inliers_log.append(n_inliers)
             self._inlier_ratio_log.append(inlier_ratio)
-            self._alignment_log.append(alignment_applied)
             self._total_appended += 1
 
             cutoff = timestamp_seconds - self._keep_seconds
@@ -580,7 +585,7 @@ class RealTimeHeartRateMonitor:
                 del self._norm_motion_log[:n_drop]
                 del self._n_matches_log[:n_drop]
                 del self._n_inliers_log[:n_drop]
-                del self._alignment_log[:n_drop]
+                del self._inlier_ratio_log[:n_drop]
 
     def n_samples(self):
         with self._lock:
@@ -624,7 +629,6 @@ class RealTimeHeartRateMonitor:
             n_matches_snapshot = list(self._n_matches_log)
             n_inliers_snapshot = list(self._n_inliers_log)
             inlier_ratio_snapshot = list(self._inlier_ratio_log)
-            alignment_snapshot = list(self._alignment_log)
 
         window_start_seconds = max(0.0, window_end_seconds - self.buffer_seconds)
         start_idx = bisect.bisect_left(ts_snapshot, window_start_seconds)
@@ -678,7 +682,12 @@ class RealTimeHeartRateMonitor:
         orb_frames = sum(1 for m in mode_slice if m == "ORB")
         mp_pct = (mediapipe_frames / n * 100.0) if n else 0.0
         orb_pct = (orb_frames / n * 100.0) if n else 0.0
-        redetections = sum(1 for r in reason_slice if r not in (None, "INITIAL"))
+        # ADDED: a GLOBAL_PASSPORT_RECOVERY frame is a recovery that did NOT
+        # call MediaPipe, so it is counted separately and excluded from the
+        # MediaPipe re-detection count.
+        passport_recoveries = sum(1 for r in reason_slice if r == "GLOBAL_PASSPORT_RECOVERY")
+        redetections = sum(1 for r in reason_slice
+                            if r not in (None, "INITIAL", "GLOBAL_PASSPORT_RECOVERY"))
         failures = sum(1 for r in reason_slice
                         if r in ("ORB_FAILURE", "RANSAC_FAILED",
                                   "GEOMETRY_REJECTED", "ORB_INIT_FAILED"))
@@ -693,16 +702,17 @@ class RealTimeHeartRateMonitor:
         matches_slice = [x for x in n_matches_snapshot[start_idx:end_idx] if x is not None]
         inliers_slice = [x for x in n_inliers_snapshot[start_idx:end_idx] if x is not None]
         inlier_ratio_slice = [x for x in inlier_ratio_snapshot[start_idx:end_idx] if x is not None]
-        # NEW: fraction of frames in this window where the current frame was
-        # actually warped back into the reference coordinate system.
-        alignment_slice = [a for a in alignment_snapshot[start_idx:end_idx] if a is not None]
         avg_disp = float(np.mean(disp_slice)) if disp_slice else None
         avg_norm_motion = float(np.mean(norm_motion_slice)) if norm_motion_slice else None
         avg_matches = float(np.mean(matches_slice)) if matches_slice else None
         avg_inliers = float(np.mean(inliers_slice)) if inliers_slice else None
         avg_inlier_ratio = float(np.mean(inlier_ratio_slice)) if inlier_ratio_slice else None
-        alignment_frac = (sum(1 for a in alignment_slice if a) / len(alignment_slice)) \
-            if alignment_slice else None
+        # ADDED: per-frame SMALL/LARGE classification -- the SAME comparison
+        # (normalized_motion > motion_threshold) the tracker itself makes for
+        # each frame, so the reported status matches the actual decisions
+        # instead of comparing a window AVERAGE against the threshold.
+        large_motion_frac = (sum(1 for m in norm_motion_slice if m > self.motion_threshold)
+                             / len(norm_motion_slice)) if norm_motion_slice else None
         if avg_disp is not None:
             self.disp_history.append(avg_disp)
         if avg_norm_motion is not None:
@@ -713,8 +723,6 @@ class RealTimeHeartRateMonitor:
             self.n_inliers_history.append(avg_inliers)
         if avg_inlier_ratio is not None:
             self.inlier_ratio_history.append(avg_inlier_ratio)
-        if alignment_frac is not None:
-            self.alignment_history.append(alignment_frac)
 
         duration = window_end_seconds - window_start_seconds
         deficit = effective_fps - self.framerate
@@ -733,6 +741,7 @@ class RealTimeHeartRateMonitor:
             print(f"MediaPipe usage: {mp_pct:.1f}%")
             print(f"ORB usage: {orb_pct:.1f}%")
             print(f"Re-detections (MediaPipe recoveries): {redetections}")
+            print(f"Global passport recoveries: {passport_recoveries}")  # ADDED
             print(f"Tracker failures: {failures}")
             print(f"ORB failures: {orb_failures}")
             print(f"RANSAC failures: {ransac_failures}")
@@ -746,17 +755,16 @@ class RealTimeHeartRateMonitor:
             norm_motion_str = f"{avg_norm_motion * 100.0:.1f}%" if avg_norm_motion is not None else "n/a"
             print(f"Median displacement: {disp_str}")
             print(f"Normalized motion: {norm_motion_str}")
-            if avg_norm_motion is not None:
-                motion_state = "LARGE" if avg_norm_motion > self.motion_threshold else "SMALL"
+            if large_motion_frac is not None:
+                # LARGE if most frames in the window were LARGE by the
+                # tracker's own per-frame rule.
+                motion_state = "LARGE" if large_motion_frac > 0.5 else "SMALL"
+                large_str = f"{large_motion_frac * 100.0:.1f}%"
             else:
                 motion_state = "n/a"
+                large_str = "n/a"
+            print(f"Large-motion frames: {large_str}")  # ADDED
             print(f"Motion classification: {motion_state}")
-            # NEW: alignment_applied diagnostic (section 16 of the spec) --
-            # lets you verify when frame alignment is actually being used,
-            # vs. small-motion frames that read the fixed ROI straight from
-            # the raw frame with no warp.
-            alignment_str = f"{alignment_frac * 100.0:.1f}%" if alignment_frac is not None else "n/a"
-            print(f"Frame alignment applied: {alignment_str}")
             print("=" * 60)
 
 
@@ -780,17 +788,16 @@ ORB_PARAMS = dict(
     fastThreshold=10,
 )
 
-# ===== search-region sizing: how far around the last known tracked
-# position ORB is allowed to look for keypoints. A rectangle, not a
-# face-oval mask -- simpler, and this is a MOTION-estimation region,
-# entirely separate from the four physiological ROI patches
-# mean_skin_rgb() reads from. =====
+# ===== search-region sizing: how far around the last known ROI location
+# ORB is allowed to look for keypoints. A rectangle, not a face-oval mask
+# -- simpler, and this is a MOTION-estimation region, entirely separate
+# from the four physiological ROI patches mean_skin_rgb() reads from. =====
 ORB_SEARCH_PADDING_RATIO = 0.6
 
 # ===== minimum keypoint / match / inlier counts before a frame's motion
 # estimate is trusted. Large motion requires a stricter inlier minimum
 # (the "extra validation for large motion" from the spec) before its
-# estimated transform is applied; below either -> MediaPipe recovery. =====
+# estimated transform is applied; below either -> recovery. =====
 MIN_ORB_KEYPOINTS = 8
 MIN_ORB_MATCHES = 8
 MIN_RANSAC_INLIERS = 6
@@ -805,23 +812,158 @@ RANSAC_REPROJ_THRESHOLD = 3.0
 MIN_INLIER_RATIO_SMALL_MOTION = 0.30
 MIN_INLIER_RATIO_LARGE_MOTION = 0.50
 
-# sanity clamp on the per-frame scale decoded from the RANSAC transform
+# sanity clamp on the scale of a RANSAC similarity transform. Applied to
+# each per-frame transform AND to the cumulative reference->current
+# transform; a transform outside this range is treated as INVALID (goes to
+# recovery) instead of being silently clipped, because clipping would make
+# the ROI rectangles disagree with the transform they are derived from.
 SCALE_CLAMP = (0.5, 2.0)
 
-# ===== the motion-decision threshold. normalized_motion = median
-# RANSAC-inlier displacement magnitude / ROI diagonal -- NOT a fixed
-# pixel count. Tunable via FaceROITracker(motion_threshold=...) /
-# --motion_threshold on the command line.
-#
-# NOTE (left exactly as found -- not changed by this edit): the
-# modification request asked to "keep the 2% threshold / MOTION_THRESHOLD
-# = 0.02 / do not replace 0.02 with another value," but the value already
-# present in this file is 0.0015 (0.15%), matching the request's own
-# flow-diagram ("If motion > .15%"). Since changing this constant was not
-# part of the ROI-following -> frame-alignment architecture change, it has
-# been left untouched here; flag if you actually want it set to 0.02. =====
-MOTION_THRESHOLD = 0.0015
-# -----------------------------------------------------------------------
+# ADDED: lightweight extra sanity limits (deliberately loose so natural head
+# motion is not rejected). Rotation is the angle of a (per-frame or
+# cumulative) similarity transform; spread is the diagonal of the bounding box
+# of the RANSAC inliers relative to the ROI diagonal (clustered inliers make
+# rotation/scale ill-conditioned).
+MAX_ROTATION_DEG = 60.0
+MIN_INLIER_SPREAD_RATIO = 0.3
+
+# =============================================================================
+# ADDED: KLT tracking layer parameters (lightweight, for ~640x480 / 30 FPS).
+# =============================================================================
+KLT_WIN_SIZE = (21, 21)
+KLT_MAX_LEVEL = 3
+KLT_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03)
+KLT_FB_CHECK = True                  # forward-backward consistency check
+KLT_MAX_FB_ERROR = 1.5               # px
+KLT_MAX_DISPLACEMENT_RATIO = 0.35    # max per-frame displacement / ROI diagonal
+KLT_MAX_HAMMING = 64                 # max ORB Hamming distance (of 256 bits) to own previous descriptor
+KLT_AMBIGUITY_RATIO = 0.85           # own distance must be < ratio * best OTHER previous descriptor
+KLT_REDETECT_RATIO = 0.5             # re-detect ORB when tracks < ratio * tracks at last detection
+
+# =============================================================================
+# ADDED (robustness pass -- integrated from the aligned variant):
+#   1) spatially distributed ORB feature detection (4x4 grid buckets)
+#   2) a facial dynamic-zone mask that keeps ORB out of eyes/eyebrows/lips
+#   3) lightweight per-patch ROI quality monitoring + dynamic patch
+#      selection, applied only to WHICH pixels feed the existing,
+#      unmodified mean_skin_rgb() -- POS/filtering/HR/SNR are untouched
+#   4) a global ORB "reference passport" used only as a recovery path
+#      when local ORB tracking fails, before falling back to MediaPipe
+# =============================================================================
+
+# ---- 1) spatially distributed ORB: 4x4 grid, top-N strongest keypoints
+# per cell, so features can't all cluster in one small patch of the
+# search region. Keypoints are detected ONCE over the whole search crop
+# (with the dynamic-zone mask), then bucketed into cells. Detecting inside
+# each tiny cell separately would lose every keypoint within
+# edgeThreshold px of each cell border, so the bucketing is done after a
+# single detect. A larger detection pool is used so that one high-contrast
+# area cannot use up the whole feature budget before bucketing. ----
+ORB_GRID_ROWS = 4
+ORB_GRID_COLS = 4
+ORB_MAX_KEYPOINTS_PER_CELL = max(1, ORB_PARAMS["nfeatures"] // (ORB_GRID_ROWS * ORB_GRID_COLS))
+ORB_GRID_DETECT_POOL = ORB_PARAMS["nfeatures"] * 4
+
+# ---- 2) dynamic-zone mask margins: eyes/eyebrows/lips hulls are dilated
+# slightly before being subtracted from the stable-zone mask, so ORB
+# keeps a small buffer away from these highly deformable regions. ----
+DYNAMIC_ZONE_EXCLUDE_PAD_RATIO = 0.35
+
+# ---- 3) per-patch physiological ROI quality thresholds. Deliberately
+# simple/cheap: how much of the patch is still inside the frame, and
+# (reusing the same skin-color test mean_skin_rgb() already applies) how
+# much of the visible patch looks like skin. ----
+ROI_MIN_VISIBLE_AREA_RATIO = 0.5
+ROI_MIN_SKIN_PIXEL_RATIO = 0.15
+
+# ---- 4) global ORB reference passport (recovery-only) parameters. ----
+PASSPORT_MAX_KEYPOINTS = 150
+MIN_PASSPORT_MATCHES = 10
+MIN_PASSPORT_INLIERS = 8
+PASSPORT_RANSAC_REPROJ_THRESHOLD = 4.0
+
+
+def build_dynamic_zone_mask(frame_shape, landmarks_px):
+    """ORB-ONLY mask (never used for the physiological ROI / mean_skin_rgb):
+    255 inside the face oval EXCEPT for the eyes/eyebrows/lips hulls
+    (dilated by DYNAMIC_ZONE_EXCLUDE_PAD_RATIO), which are zeroed out.
+    What remains -- forehead, nose bridge/upper nose, cheeks, jawline --
+    is where ORB is preferentially allowed to place motion-tracking
+    keypoints. Uses the same landmark groups (_FACE_OVAL_IDX,
+    _EXCLUDE_IDX_GROUPS) and the same _dilate_hull() helper already
+    defined above; does not touch compute_roi_rects() or build_roi_mask()."""
+    h, w = frame_shape[:2]
+    oval_pts = landmarks_px[_FACE_OVAL_IDX].astype(np.int32)
+    oval_hull = cv2.convexHull(oval_pts)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, oval_hull, 255)
+    for group_idx in _EXCLUDE_IDX_GROUPS:
+        pts = landmarks_px[group_idx].astype(np.int32).reshape(-1, 1, 2)
+        if len(pts) < 3:
+            continue
+        hull = cv2.convexHull(pts)
+        hull = _dilate_hull(hull, DYNAMIC_ZONE_EXCLUDE_PAD_RATIO)
+        cv2.fillConvexPoly(mask, hull, 0)
+    return mask
+
+
+def _assess_roi_patch_quality(frame_bgr, rect, use_color_skin_mask=True):
+    """Lightweight, read-only quality check for ONE physiological ROI
+    patch (forehead / left_cheek / right_cheek / chin). Only decides
+    whether this patch's pixels should be included in the mask handed to
+    the existing, unmodified mean_skin_rgb() this frame -- never touches
+    mean_skin_rgb() itself, build_roi_mask(), or POS. Returns True
+    (usable) or False (unreliable this frame)."""
+    h, w = frame_bgr.shape[:2]
+    x, y, rw, rh = rect
+    x0, y0 = int(round(x)), int(round(y))
+    x1, y1 = int(round(x + rw)), int(round(y + rh))
+    x0c, y0c = max(0, x0), max(0, y0)
+    x1c, y1c = min(w, x1), min(h, y1)
+    full_area = max(rw * rh, 1.0)
+    visible_w, visible_h = max(0, x1c - x0c), max(0, y1c - y0c)
+    visible_area = visible_w * visible_h
+    if visible_area <= 0:
+        return False
+    if (visible_area / full_area) < ROI_MIN_VISIBLE_AREA_RATIO:
+        return False  # too much of the patch has left the frame
+
+    if use_color_skin_mask:
+        patch = frame_bgr[y0c:y1c, x0c:x1c]
+        if patch.size == 0:
+            return False
+        skin_mask = skin_detector.process(patch)  # same skin classifier mean_skin_rgb() uses
+        skin_ratio = float(np.sum(skin_mask > 0)) / float(skin_mask.size)
+        if skin_ratio < ROI_MIN_SKIN_PIXEL_RATIO:
+            return False  # patch is mostly non-skin this frame (occlusion, misalignment, ...)
+
+    return True
+
+
+def select_valid_roi_mask(frame_bgr, rois, frame_shape, use_color_skin_mask=True):
+    """Patch-selection layer, applied BEFORE the existing mean_skin_rgb()
+    input mask is assembled: builds a mask from only the physiological
+    patches (`rois`, in CURRENT-frame coordinates) that currently pass
+    _assess_roi_patch_quality(), falling back to the full union of all
+    four patches (the pre-existing, unconditional behavior) if every
+    patch looks unreliable this frame. mean_skin_rgb() and POS's
+    downstream math are completely untouched -- only which pixels are
+    handed in changes. Returns (mask, bbox, per_patch_quality_dict)."""
+    if rois is None:
+        return None, None, {}
+
+    quality = {name: _assess_roi_patch_quality(frame_bgr, rect, use_color_skin_mask)
+               for name, rect in rois.items()}
+    valid_rects = {name: rect for name, rect in rois.items() if quality[name]}
+
+    if not valid_rects:
+        # Every patch looked unreliable -- fall back to the ORIGINAL,
+        # unconditional four-patch union rather than inventing a POS
+        # formulation for zero valid patches.
+        valid_rects = rois
+
+    mask, bbox = _mask_from_rects(frame_shape, valid_rects)
+    return mask, bbox, quality
 
 
 def open_camera(camera_index, fourcc="MJPG", no_dshow=False, no_v4l2=False):
@@ -894,76 +1036,76 @@ def print_negotiated_fourcc(camera, requested_fourcc):
 class FaceROITracker:
     """
     Flow: MediaPipe init -> physiological ROI definition (frozen as
-    `reference_rois` in the reference coordinate system) -> ORB feature
-    detection (expanded search region around the last known tracked
-    position) -> ORB descriptor matching -> RANSAC outlier rejection ->
-    dominant motion from inliers -> normalized_motion vs
-    MOTION_THRESHOLD -> for LARGE motion, warp the CURRENT FRAME back
-    into the reference coordinate system (INTER_NEAREST) and read the
-    FIXED reference ROI from the aligned frame; for SMALL motion, read
-    the same fixed reference ROI directly from the raw current frame.
-    MediaPipe recovery only if ORB/RANSAC cannot reliably maintain
-    tracking, and recovery is what (re)freezes `reference_rois`.
+    `reference_rois`) -> ORB feature detection (expanded search region
+    around the ROI, 4x4-grid distributed, dynamic-zone masked) -> ORB
+    descriptor matching -> RANSAC outlier rejection -> dominant motion
+    from inliers -> normalized_motion vs MOTION_THRESHOLD -> update the
+    cumulative reference->current transform and recompute the ROI
+    coordinates from it -> on failure: global ORB passport recovery ->
+    MediaPipe recovery only if that also fails.
 
-    process() returns:
-        (aligned_frame_or_None, mask_or_None, bbox_or_None, mode, reason,
-         median_displacement, normalized_motion, n_matches, n_inliers,
-         inlier_ratio, alignment_applied)
-
-    where mode is "MEDIAPIPE" or "ORB", aligned_frame is the current RGB
-    frame warped into the reference coordinate system (only when
-    alignment_applied is True; otherwise None, meaning "read `mask`/
-    `bbox` directly from the raw current frame"), and reason is one of:
+    process() returns (mask_or_None, bbox_or_None, mode, reason,
+    median_displacement, normalized_motion, n_matches, n_inliers,
+    inlier_ratio) where mode is "MEDIAPIPE" or "ORB", and reason is one of:
         None                  -- normal ORB-tracked frame
         "INITIAL"              -- the very first-ever detection
         "ORB_FAILURE"          -- too few ORB keypoints in the search region, or too few matches
         "RANSAC_FAILED"        -- RANSAC failed to fit a model, or too few inliers for the
                                    applicable confidence tier (small vs large motion)
-        "GEOMETRY_REJECTED"    -- resulting tracked position left the frame / became degenerate
+        "GEOMETRY_REJECTED"    -- resulting ROI left the frame / transform was invalid
         "ORB_INIT_FAILED"      -- after a fresh MediaPipe detection, ORB re-seeding found
                                    too few keypoints in the search region
         "NO_TRACKER_AVAILABLE" -- --tracker none was requested; MediaPipe runs every frame
+        "GLOBAL_PASSPORT_RECOVERY" -- ADDED: local ORB tracking failed and was recovered
+                                   via the global ORB reference passport WITHOUT calling
+                                   MediaPipe; mode is "ORB", not "MEDIAPIPE"
     """
 
-    def __init__(self, tracker_kind="orb", max_gap=5, motion_threshold=MOTION_THRESHOLD):
+    def __init__(self, tracker_kind="orb", max_gap=5, motion_threshold=MOTION_THRESHOLD,
+                 klt_enabled=True, klt_redetect_ratio=KLT_REDETECT_RATIO):
         self.tracker_kind = tracker_kind  # "orb" or None (== --tracker none)
+        self.klt_enabled = klt_enabled and tracker_kind is not None   # ADDED
+        self.klt_redetect_ratio = klt_redetect_ratio                  # ADDED
         self.max_gap = max_gap
         self.motion_threshold = motion_threshold  # normalized_motion above this -> "large" motion
         self.gap_count = 0
 
-        # `last_roi_rects` / `last_roi_bbox`: the tracker's current best
-        # guess of WHERE THE FACE IS in the raw current frame. This still
-        # moves frame-to-frame exactly as before, but its ONLY remaining
-        # job is telling ORB where to search for keypoints next frame --
-        # it is no longer used to decide which pixels feed mean_skin_rgb().
-        self.last_roi_rects = None      # {name: (x, y, w, h)} search-position rectangles
+        self.last_roi_rects = None      # {name: (x, y, w, h)} -- current physiological ROI patches
         self.last_roi_bbox = None       # union bbox of the above, kept in lockstep for cheap reuse
 
-        # `reference_rois` / `reference_mask` / `reference_bbox`: the
-        # FIXED physiological ROI, frozen at the last MediaPipe
-        # (re)detection, in the reference coordinate system. These never
-        # move due to ORB/RANSAC motion -- this is what mean_skin_rgb()
-        # actually reads from every frame.
+        # ADDED: the four physiological patches exactly as defined at the
+        # last MediaPipe (re)detection (REFERENCE coordinates), and the
+        # cumulative REFERENCE -> CURRENT similarity transform (3x3
+        # homogeneous). `last_roi_rects` is always
+        #     reference_rois mapped through reference_to_current
+        # so the four patches keep their exact relative geometry on the
+        # face. Reset (identity) at every MediaPipe (re)detection.
         self.reference_rois = None
-        self.reference_mask = None
-        self.reference_bbox = None
-
-        # Running current-frame -> reference-frame transform (3x3
-        # homogeneous), composed frame-by-frame from the INVERSE of each
-        # RANSAC previous->current transform. Reset to identity every
-        # time a new reference is established.
-        self.to_reference_transform = np.eye(3, dtype=np.float64)
+        self.reference_to_current = np.eye(3, dtype=np.float64)
 
         # ORB/RANSAC motion-tracking state. Entirely separate from the
         # physiological ROI: these points are picked from an expanded
         # search region for motion estimation only, never used to select
         # pixels for mean_skin_rgb().
         self.orb = cv2.ORB_create(**ORB_PARAMS)
+        # ADDED: same parameters but a larger detection pool, used only to
+        # DETECT candidates before 4x4 bucketing (descriptors are still
+        # computed by self.orb above).
+        self.orb_grid_detector = cv2.ORB_create(**dict(ORB_PARAMS, nfeatures=ORB_GRID_DETECT_POOL))
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         self.orb_prev_pts_full = None   # previous frame's ORB keypoints, FULL-FRAME coords, Nx2
         self.orb_prev_des = None        # previous frame's ORB descriptors
-        self.roi_center = None          # centroid of the search-position rects at last (re)seed
-        self.roi_diagonal = None        # ROI diagonal (sqrt(w^2+h^2)) at last (re)seed --
+        # ADDED (KLT layer): per-keypoint (size, angle, octave) of the previous
+        # set (needed to re-describe tracked points), the previous gray frame
+        # KLT tracks from, the track count at the last (re)detection, and the
+        # non-crosscheck matcher used for the ambiguity test.
+        self.orb_prev_meta = None
+        self.klt_prev_gray = None
+        self.klt_ref_track_count = 0
+        self._last_kp_meta = None
+        self.klt_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        self.klt_frame_count = 0
+        self.roi_diagonal = None        # ROI diagonal (sqrt(w^2+h^2)) at last MediaPipe (re)detection --
                                          # the "characteristic size of the physiological ROI"
                                          # used to normalize median displacement into normalized_motion
 
@@ -974,7 +1116,24 @@ class FaceROITracker:
         self.orb_failure_count = 0
         self.ransac_failure_count = 0
 
-    # ---- small geometry helpers (unchanged from prior versions) --------
+        # ---- ADDED: dynamic-zone mask (ORB-only; see build_dynamic_zone_mask()) --
+        # A crop of the stable-zone mask, sized to the ORB search region at
+        # the moment of the last MediaPipe (re)detection. Reused (resized,
+        # not recomputed) on later ORB-only frames since no fresh landmarks
+        # are available between detections.
+        self.dynamic_mask_ref_crop = None
+
+        # ---- ADDED: global ORB "reference passport" (recovery-only) ----
+        # A bounded set of strong ORB descriptors + their reference-frame
+        # coordinates, captured once at each MediaPipe (re)detection over a
+        # region covering the whole face (not just the local search
+        # region). Consulted ONLY when local ORB tracking fails, before
+        # falling back to MediaPipe recovery.
+        self.passport_pts_full = None
+        self.passport_des = None
+        self.passport_recovery_count = 0
+
+    # ---- small geometry helpers ----------------------------------------
 
     @staticmethod
     def _rects_center(rects):
@@ -996,15 +1155,15 @@ class FaceROITracker:
     # ---- explicit, multi-criterion reliability decision -----------------
     # Spec requirement: "Do not use a single metric as a confidence score."
     # This is the ONE place that decides whether a motion estimate is
-    # trustworthy enough to be applied at all. It always checks match
-    # count, inlier count, AND inlier ratio together -- a raw inlier
+    # trustworthy enough to update the physiological ROI. It always checks
+    # match count, inlier count, AND inlier ratio together -- a raw inlier
     # count alone is misleading (10/100 is very different from 10/12).
     # Large motion is held to a stricter bar on every one of these.
     @staticmethod
     def _motion_estimate_is_reliable(n_matches, n_inliers, inlier_ratio, is_large_motion):
         """Returns (reliable: bool, failure_reason: str_or_None).
         failure_reason is only used for logging/debugging; the caller
-        always maps a False result to MediaPipe recovery."""
+        always maps a False result to recovery."""
         min_matches = MIN_ORB_MATCHES
         min_inliers = MIN_RANSAC_INLIERS_LARGE_MOTION if is_large_motion else MIN_RANSAC_INLIERS
         min_ratio = MIN_INLIER_RATIO_LARGE_MOTION if is_large_motion else MIN_INLIER_RATIO_SMALL_MOTION
@@ -1018,37 +1177,57 @@ class FaceROITracker:
         return True, None
 
     @staticmethod
-    def _apply_rigid_transform_to_rects(rects, translation, scale, ref_center):
-        """Applies one rigid (translation + uniform scale about ref_center)
-        transform to every tracked search-position rectangle -- ALGEBRAIC
-        coordinate update only. This is used ONLY to keep
-        `last_roi_rects`/`last_roi_bbox` (the ORB search-region driver)
-        following the face; it no longer has anything to do with which
-        pixels get read for mean_skin_rgb() (that's the FIXED
-        `reference_rois`/`reference_mask`/`reference_bbox` now). Assumes
-        the face plane moves ~rigidly between consecutive frames,
-        reasonable for small frame-to-frame motion at ~30 fps."""
-        cx, cy = ref_center
-        ncx, ncy = cx + translation[0], cy + translation[1]
+    def _transform_is_valid(A):
+        """A (2x3 or 3x3) similarity transform is usable only if every entry
+        is finite, its uniform scale lies inside SCALE_CLAMP, and its rotation
+        is within +/-MAX_ROTATION_DEG."""
+        A = np.asarray(A, dtype=np.float64)
+        if not np.all(np.isfinite(A)):
+            return False
+        s = float(np.hypot(A[0, 0], A[1, 0]))
+        if not (SCALE_CLAMP[0] <= s <= SCALE_CLAMP[1]):
+            return False
+        return abs(float(np.degrees(np.arctan2(A[1, 0], A[0, 0])))) <= MAX_ROTATION_DEG
+
+    @staticmethod
+    def _apply_affine_to_rects(rects, A):
+        """Maps every rectangle through the similarity transform A (2x3 or
+        3x3): the rectangle CENTER goes through the full transform
+        (rotation + scale + translation about the ORIGIN, i.e. exactly what
+        RANSAC estimated), and the side length is scaled by the transform's
+        uniform scale. Patches stay axis-aligned squares (same convention as
+        how they were defined). ALGEBRAIC coordinate update only -- the RGB
+        frame is never warped/interpolated. Because every patch center is
+        mapped by the SAME transform, the patches keep their exact relative
+        positions on the face (up to the face's own similarity motion)."""
+        s = float(np.hypot(A[0, 0], A[1, 0]))
         new_rects = {}
         for name, (x, y, w, h) in rects.items():
-            rel_x = (x + w / 2.0 - cx) * scale
-            rel_y = (y + h / 2.0 - cy) * scale
-            new_cx = ncx + rel_x
-            new_cy = ncy + rel_y
-            new_w = w * scale
-            new_h = h * scale
-            new_rects[name] = (new_cx - new_w / 2.0, new_cy - new_h / 2.0, new_w, new_h)
+            cx, cy = x + w / 2.0, y + h / 2.0
+            ncx = A[0, 0] * cx + A[0, 1] * cy + A[0, 2]
+            ncy = A[1, 0] * cx + A[1, 1] * cy + A[1, 2]
+            nw, nh = w * s, h * s
+            new_rects[name] = (float(ncx - nw / 2.0), float(ncy - nh / 2.0), float(nw), float(nh))
         return new_rects
+
+    def _rects_from_reference_transform(self, ref_to_cur_3x3, frame_shape):
+        """Current-frame ROI rectangles = reference_rois mapped through the
+        given cumulative reference->current transform. Returns None if the
+        transform is invalid or any resulting patch leaves the frame."""
+        if self.reference_rois is None or not self._transform_is_valid(ref_to_cur_3x3):
+            return None
+        rects = self._apply_affine_to_rects(self.reference_rois, ref_to_cur_3x3)
+        if not self._rois_in_bounds(rects, frame_shape):
+            return None
+        return rects
 
     # ---- ORB: search-region feature detection (motion estimation only) --
 
     @staticmethod
     def _expanded_search_rect(bbox, frame_shape):
-        """Expanded rectangle around the last known tracked-position bbox
-        -- ORB looks here, and ONLY here, never the whole frame. Purely a
-        motion-estimation region, unrelated to the fixed physiological
-        ROI patches."""
+        """Expanded rectangle around the last known ROI bbox -- ORB looks
+        here, and ONLY here, never the whole frame. Purely a motion-
+        estimation region, unrelated to the physiological ROI patches."""
         x, y, w, h = bbox
         fh, fw = frame_shape[:2]
         pad_x = w * ORB_SEARCH_PADDING_RATIO
@@ -1060,20 +1239,63 @@ class FaceROITracker:
         return x0, y0, x1, y1
 
     def _detect_orb_in_region(self, gray, ref_bbox, frame_shape):
-        """Runs ORB detectAndCompute on the expanded search-region crop
-        only, then converts keypoints back to full-frame pixel coords so
-        they can be matched/measured consistently across frames even
-        though each frame's crop may be at a different offset."""
+        """Runs ORB detection on the expanded search-region crop only
+        (never the whole frame), then converts keypoints back to
+        full-frame pixel coords so they can be matched/measured
+        consistently across frames even though each frame's crop may be
+        at a different offset.
+
+        ADDED, within this same single detection pass (no second
+        ORB/RANSAC run is introduced anywhere else):
+          - a dynamic-zone mask (built once per MediaPipe (re)detection
+            from face landmarks, see build_dynamic_zone_mask(), and
+            simply resized to match this crop's size on later frames)
+            keeps ORB out of the eyes/eyebrows/lips and prefers the more
+            rigid forehead/nose/cheek/jaw areas.
+          - spatially distributed selection: candidates are bucketed into
+            an ORB_GRID_ROWS x ORB_GRID_COLS grid over the crop and at
+            most ORB_MAX_KEYPOINTS_PER_CELL of the strongest are kept per
+            cell, so keypoints can't all cluster in one small area.
+        Descriptors for the final merged keypoint list are computed in
+        ONE self.orb.compute() call; BFMatcher/RANSAC downstream are
+        unchanged."""
+        self._last_kp_meta = None
         if ref_bbox is None:
             return None, None
         x0, y0, x1, y1 = self._expanded_search_rect(ref_bbox, frame_shape)
         if x1 - x0 < 8 or y1 - y0 < 8:
             return None, None
         crop = gray[y0:y1, x0:x1]
-        kp, des = self.orb.detectAndCompute(crop, None)
+        ch, cw = crop.shape[:2]
+
+        zone_mask = None
+        if self.dynamic_mask_ref_crop is not None and self.dynamic_mask_ref_crop.size > 0:
+            zone_mask = cv2.resize(self.dynamic_mask_ref_crop, (cw, ch),
+                                    interpolation=cv2.INTER_NEAREST)
+            if not np.any(zone_mask):
+                return None, None  # search region lies entirely inside excluded zones
+
+        candidates = self.orb_grid_detector.detect(crop, zone_mask)
+        if not candidates:
+            return None, None
+
+        cells = {}
+        for k in candidates:
+            r = min(int(k.pt[1] * ORB_GRID_ROWS / ch), ORB_GRID_ROWS - 1)
+            c = min(int(k.pt[0] * ORB_GRID_COLS / cw), ORB_GRID_COLS - 1)
+            cells.setdefault((r, c), []).append(k)
+        all_kp = []
+        for cell_kp in cells.values():
+            cell_kp.sort(key=lambda k: k.response, reverse=True)
+            all_kp.extend(cell_kp[:ORB_MAX_KEYPOINTS_PER_CELL])
+
+        kp, des = self.orb.compute(crop, all_kp)
         if des is None or len(kp) == 0:
             return None, None
         pts_full = np.array([[p.pt[0] + x0, p.pt[1] + y0] for p in kp], dtype=np.float32)
+        # ADDED: keep (size, angle, octave) per keypoint, aligned with pts_full/des,
+        # so tracked points can later be re-described in the same way.
+        self._last_kp_meta = np.array([[p.size, p.angle, p.octave] for p in kp], dtype=np.float32)
         return pts_full, des
 
     # ---- MediaPipe: initial detection + genuine recovery ----------------
@@ -1091,12 +1313,9 @@ class FaceROITracker:
             self.gap_count += 1
             self.mediapipe_frame_count += 1
             if self.last_roi_rects is not None and self.gap_count <= self.max_gap:
-                # Reuse the existing FIXED reference ROI -- do not move it,
-                # and do not attempt an alignment warp with no new motion
-                # estimate to base one on.
-                return (None, self.reference_mask, self.reference_bbox, "MEDIAPIPE", reason,
-                        None, None, None, None, None, False)
-            return None, None, None, "MEDIAPIPE", reason, None, None, None, None, None, False
+                mask, bbox = _mask_from_rects(frame.shape, self.last_roi_rects)
+                return mask, bbox, "MEDIAPIPE", reason, None, None, None, None, None
+            return None, None, "MEDIAPIPE", reason, None, None, None, None, None
 
         landmarks_px = landmarks_to_pixels(result.face_landmarks[0], frame.shape)
         mask, bbox = build_roi_mask(frame.shape, landmarks_px)  # UNCHANGED signature/semantics
@@ -1109,39 +1328,253 @@ class FaceROITracker:
         self.gap_count = 0
         self.mediapipe_frame_count += 1
 
-        # ===== (Re)establish the FIXED reference: this frame becomes the
-        # reference coordinate system, and these ROI rectangles are frozen
-        # as `reference_rois` until the next genuine MediaPipe recovery.
-        # This is the ONLY place `reference_rois`/`reference_mask`/
-        # `reference_bbox`/`to_reference_transform` are (re)set -- ordinary
-        # ORB/RANSAC motion, however large, never touches them (spec §13/§14). =====
+        # ---- ADDED: (re)establish the REFERENCE ROI. This detection's
+        # landmark-based patches become `reference_rois`, and the
+        # cumulative reference->current transform restarts at identity.
+        # roi_diagonal is set here unconditionally (not only when ORB
+        # re-seeding succeeds) so it can never be left stale from an older
+        # detection. ----
         self.reference_rois = roi_rects
-        self.reference_mask = mask
-        self.reference_bbox = bbox
-        self.to_reference_transform = np.eye(3, dtype=np.float64)
+        self.reference_to_current = np.eye(3, dtype=np.float64)
+        self.roi_diagonal = max(float(np.hypot(bbox[2], bbox[3])), 1.0)
+
+        # ---- ADDED: (re)build the ORB-only dynamic-zone mask (eyes/mouth
+        # excluded) from this detection's landmarks, cropped to the same
+        # expanded search region ORB is about to be (re)seeded from. Later
+        # ORB-only frames just resize this crop (see _detect_orb_in_region())
+        # since fresh landmarks aren't available until the next MediaPipe
+        # (re)detection. Never touches `mask`/`bbox`/`roi_rects` above --
+        # those remain the unmodified physiological ROI. ----
+        dynamic_zone_mask_full = build_dynamic_zone_mask(frame.shape, landmarks_px)
+        dz_x0, dz_y0, dz_x1, dz_y1 = self._expanded_search_rect(bbox, frame.shape)
+        dz_crop = dynamic_zone_mask_full[dz_y0:dz_y1, dz_x0:dz_x1]
+        self.dynamic_mask_ref_crop = dz_crop.copy() if dz_crop.size > 0 else None
+
+        # ---- ADDED: (re)capture the global ORB reference passport -- a
+        # bounded set of strong descriptors covering the WHOLE face oval
+        # (wider than the local search region), used only for recovery
+        # (see _attempt_global_passport_recovery()). Runs once per MediaPipe
+        # (re)detection only, never every frame. Only when tracking is
+        # enabled. ----
+        self.passport_pts_full = None
+        self.passport_des = None
+        if self.tracker_kind is not None:
+            oval_pts_i = landmarks_px[_FACE_OVAL_IDX].astype(np.int32)
+            oval_rect = cv2.boundingRect(cv2.convexHull(oval_pts_i))
+            px0, py0, px1, py1 = self._expanded_search_rect(oval_rect, frame.shape)
+            passport_crop = gray[py0:py1, px0:px1]
+            if passport_crop.size > 0:
+                p_kp, p_des = self.orb.detectAndCompute(passport_crop, None)
+                if p_des is not None and len(p_kp) > 0:
+                    order = np.argsort([-k.response for k in p_kp])[:PASSPORT_MAX_KEYPOINTS]
+                    self.passport_des = p_des[order]
+                    self.passport_pts_full = np.array(
+                        [[p_kp[i].pt[0] + px0, p_kp[i].pt[1] + py0] for i in order],
+                        dtype=np.float32)
 
         # (Re)seed the ORB reference frame from an expanded search region
-        # around the freshly (re)defined tracked position. Tracking-only;
-        # never affects which pixels feed POS (that's always the fixed
-        # `reference_mask`/`reference_bbox`, via the unmodified mean_skin_rgb()).
+        # around the freshly (re)defined physiological ROI. Tracking-only;
+        # never affects which pixels feed POS (that's always `mask`/roi_rects,
+        # via the unmodified mean_skin_rgb()).
         self.orb_prev_pts_full = None
         self.orb_prev_des = None
+        self.orb_prev_meta = None
+        self.klt_prev_gray = None
         if self.tracker_kind is not None:
             pts_full, des = self._detect_orb_in_region(gray, bbox, frame.shape)
             if des is not None and len(pts_full) >= MIN_ORB_KEYPOINTS:
                 self.orb_prev_pts_full = pts_full
                 self.orb_prev_des = des
-                self.roi_center = self._rects_center(roi_rects)
-                self.roi_diagonal = max(float(np.hypot(bbox[2], bbox[3])), 1.0)
+                self.orb_prev_meta = self._last_kp_meta      # ADDED (KLT)
+                self.klt_prev_gray = gray                     # ADDED (KLT)
+                self.klt_ref_track_count = len(pts_full)      # ADDED (KLT)
             else:
                 n_found = 0 if pts_full is None else len(pts_full)
                 print(f"WARNING: ORB found only {n_found} keypoint(s) in the "
                       f"search region (< {MIN_ORB_KEYPOINTS}); will retry "
                       f"detection next frame.")
 
-        # Fresh reference frame: no motion yet, so nothing to warp. Read
-        # the fixed reference ROI straight from this (== reference) frame.
-        return None, mask, bbox, "MEDIAPIPE", reason, None, None, None, None, None, False
+        return mask, bbox, "MEDIAPIPE", reason, None, None, None, None, None
+
+    # ---- ADDED: global ORB reference passport (recovery-only) -----------
+
+    def _attempt_global_passport_recovery(self, gray, frame):
+        """Recovery-only, consulted when local ORB tracking has just failed
+        (see _fail_to_recovery()). Matches the saved reference-frame
+        "passport" descriptors (captured once at the last MediaPipe
+        (re)detection) against a fresh ORB detection over the WHOLE current
+        frame, using the same BFMatcher and the same
+        cv2.estimateAffinePartial2D + RANSAC mechanism used for local
+        tracking. The estimated transform maps REFERENCE -> CURRENT
+        directly, which is exactly the cumulative transform this tracker
+        keeps, so it REPLACES reference_to_current (no chaining, which also
+        discards any accumulated drift) and the ROI rectangles are simply
+        reference_rois mapped through it.
+
+        All new state is computed into locals and COMMITTED ONLY AFTER every
+        step (validity, bounds, local ORB re-seed) has succeeded, so a
+        failed attempt never leaves the tracker half-updated. Returns True
+        on success, False otherwise (caller falls back to MediaPipe)."""
+        if (self.passport_des is None or self.passport_pts_full is None
+                or self.reference_rois is None):
+            return False
+
+        curr_kp, curr_des = self.orb.detectAndCompute(gray, None)
+        if curr_des is None or len(curr_kp) == 0:
+            return False
+
+        try:
+            matches = self.matcher.match(self.passport_des, curr_des)
+        except cv2.error:
+            return False
+        if len(matches) < MIN_PASSPORT_MATCHES:
+            return False
+
+        ref_matched = np.float32([self.passport_pts_full[m.queryIdx] for m in matches])
+        curr_matched = np.float32([curr_kp[m.trainIdx].pt for m in matches])
+
+        M, inlier_mask = cv2.estimateAffinePartial2D(
+            ref_matched, curr_matched, method=cv2.RANSAC,
+            ransacReprojThreshold=PASSPORT_RANSAC_REPROJ_THRESHOLD, maxIters=2000, confidence=0.99,
+        )
+        if M is None or inlier_mask is None:
+            return False
+        n_inliers = int(np.sum(inlier_mask.ravel() == 1))
+        if n_inliers < MIN_PASSPORT_INLIERS:
+            return False
+
+        new_T = np.vstack([M, [0.0, 0.0, 1.0]]).astype(np.float64)  # REFERENCE -> CURRENT
+        new_rects = self._rects_from_reference_transform(new_T, frame.shape)
+        if new_rects is None:
+            return False
+        new_mask, new_bbox = _mask_from_rects(frame.shape, new_rects)
+        if new_bbox is None:
+            return False
+
+        # Re-seed LOCAL ORB tracking (same _detect_orb_in_region() used
+        # every other frame) from the recovered position, so ordinary
+        # per-frame tracking resumes starting next frame.
+        pts_full, des = self._detect_orb_in_region(gray, new_bbox, frame.shape)
+        if des is None or len(pts_full) < MIN_ORB_KEYPOINTS:
+            return False
+
+        # ---- commit ----
+        self.reference_to_current = new_T
+        self.last_roi_rects = new_rects
+        self.last_roi_bbox = new_bbox
+        self.orb_prev_pts_full = pts_full
+        self.orb_prev_des = des
+        self.orb_prev_meta = self._last_kp_meta      # ADDED (KLT)
+        self.klt_prev_gray = gray                     # ADDED (KLT)
+        self.klt_ref_track_count = len(pts_full)      # ADDED (KLT)
+        self.passport_recovery_count += 1
+        return True
+
+    def _fail_to_recovery(self, gray, frame, landmarker, timestamp_ms, reason):
+        """Single choke point every local-tracking failure in process()
+        routes through: try the global passport first (cheap, bounded,
+        recovery-only), and only fall back to the existing MediaPipe
+        recovery mechanism if that also fails or isn't available yet. A
+        failed tracking attempt therefore never disables tracking -- the
+        next frame re-seeds through MediaPipe if needed."""
+        if self._attempt_global_passport_recovery(gray, frame):
+            self.orb_frame_count += 1
+            mask, bbox = _mask_from_rects(frame.shape, self.last_roi_rects)
+            return (mask, bbox, "ORB", "GLOBAL_PASSPORT_RECOVERY",
+                    None, None, None, None, None)
+        return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, reason, gray)
+
+    # ---- ADDED: KLT propagation + ORB-descriptor validation ---------------
+
+    def _klt_correspondences(self, gray, frame_shape):
+        """KLT -> ORB-descriptor validation. Propagates the previous ORB
+        keypoints into the current frame with pyramidal Lucas-Kanade, then
+        validates every tracked point; KLT alone is never trusted:
+          1. optical-flow status (+ forward-backward consistency),
+          2. finite position inside the valid tracking region (the same
+             expanded search rect ORB uses, around the last tracked ROI),
+          3. plausible per-frame displacement (<= KLT_MAX_DISPLACEMENT_RATIO
+             of the ROI diagonal),
+          4. appearance: the ORB descriptor re-computed at the tracked
+             location must be close (Hamming, binary descriptors) to the
+             point's previous descriptor (<= KLT_MAX_HAMMING) AND clearly
+             closer than to any OTHER previous descriptor (ambiguity ratio
+             test, KLT_AMBIGUITY_RATIO).
+        Returns (prev_xy, curr_xy, curr_des, meta) for the surviving
+        correspondences, or None if too few survive (caller then falls back
+        to the original detect-ORB-and-match path for this frame). The
+        survivors go to the UNCHANGED RANSAC similarity fit in process()."""
+        if (not self.klt_enabled or self.klt_prev_gray is None
+                or self.orb_prev_pts_full is None or self.orb_prev_meta is None
+                or self.orb_prev_des is None or self.last_roi_bbox is None
+                or self.klt_prev_gray.shape != gray.shape):
+            return None
+        prev_xy = self.orb_prev_pts_full.reshape(-1, 2).astype(np.float32)
+        if len(prev_xy) < MIN_ORB_KEYPOINTS:
+            return None
+
+        lk = dict(winSize=KLT_WIN_SIZE, maxLevel=KLT_MAX_LEVEL, criteria=KLT_CRITERIA)
+        try:
+            cur_pts, st, _ = cv2.calcOpticalFlowPyrLK(
+                self.klt_prev_gray, gray, prev_xy.reshape(-1, 1, 2), None, **lk)
+            if cur_pts is None or st is None:
+                return None
+            ok = st.ravel() == 1
+            if KLT_FB_CHECK:
+                back, st_b, _ = cv2.calcOpticalFlowPyrLK(
+                    gray, self.klt_prev_gray, cur_pts, None, **lk)
+                if back is None or st_b is None:
+                    return None
+                fb = np.linalg.norm(back.reshape(-1, 2) - prev_xy, axis=1)
+                ok &= (st_b.ravel() == 1) & (fb <= KLT_MAX_FB_ERROR)
+        except cv2.error:
+            return None
+
+        cur_xy = cur_pts.reshape(-1, 2)
+        finite = np.isfinite(cur_xy).all(axis=1)
+        cur_xy = np.where(finite[:, None], cur_xy, 0.0)
+        x0, y0, x1, y1 = self._expanded_search_rect(self.last_roi_bbox, frame_shape)
+        inside = (cur_xy[:, 0] >= x0) & (cur_xy[:, 0] < x1) & \
+                 (cur_xy[:, 1] >= y0) & (cur_xy[:, 1] < y1)
+        disp = np.linalg.norm(cur_xy - prev_xy, axis=1)
+        max_disp = KLT_MAX_DISPLACEMENT_RATIO * max(self.roi_diagonal or 1.0, 1.0)
+        ok &= finite & inside & (disp <= max_disp)
+
+        idx = np.flatnonzero(ok)
+        if len(idx) < MIN_ORB_MATCHES:
+            return None
+
+        # Appearance validation: re-describe the tracked points in the
+        # current frame (same crop the detector uses), reusing each point's
+        # previous size/angle/octave.
+        crop = gray[y0:y1, x0:x1]
+        meta = self.orb_prev_meta
+        kps = [cv2.KeyPoint(float(cur_xy[i, 0] - x0), float(cur_xy[i, 1] - y0),
+                            float(meta[i, 0]), float(meta[i, 1]), 0.0,
+                            int(meta[i, 2]), int(i)) for i in idx]
+        kps, des = self.orb.compute(crop, kps)
+        if des is None or len(kps) < MIN_ORB_MATCHES:
+            return None
+        prev_idx = np.array([k.class_id for k in kps], dtype=np.int64)
+        prev_des = self.orb_prev_des
+
+        own = np.unpackbits(np.bitwise_xor(des, prev_des[prev_idx]), axis=1).sum(axis=1)
+        try:
+            knn = self.klt_matcher.knnMatch(des, prev_des, k=2)
+        except cv2.error:
+            return None
+        good = np.zeros(len(prev_idx), dtype=bool)
+        for j, i in enumerate(prev_idx):
+            if own[j] > KLT_MAX_HAMMING:
+                continue
+            others = [m.distance for m in knn[j] if m.trainIdx != i]
+            second = min(others) if others else float("inf")
+            good[j] = own[j] < KLT_AMBIGUITY_RATIO * second
+        if int(good.sum()) < MIN_ORB_MATCHES:
+            return None
+
+        sel = prev_idx[good]
+        return prev_xy[sel], cur_xy[sel].astype(np.float32), des[good], meta[sel]
 
     # ---- main per-frame entry point --------------------------------------
 
@@ -1157,27 +1590,40 @@ class FaceROITracker:
                 reason = "ORB_INIT_FAILED"
             return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, reason, gray)
 
-        # ---- ORB: detect + describe keypoints in the expanded search region ----
-        curr_pts_full, curr_des = self._detect_orb_in_region(gray, self.last_roi_bbox, frame.shape)
-        if curr_des is None or len(curr_pts_full) < MIN_ORB_KEYPOINTS:
-            self.orb_failure_count += 1
-            self.orb_prev_des = None
-            return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, "ORB_FAILURE", gray)
+        # ---- ADDED: KLT propagation + ORB-descriptor validation. If enough
+        # validated correspondences survive they replace the detect+match
+        # step below (no ORB detection this frame); otherwise (None) the
+        # ORIGINAL ORB detect + BFMatcher path runs unchanged. Either way the
+        # correspondences go to the same RANSAC fit. ----
+        klt = self._klt_correspondences(gray, frame.shape)
+        if klt is not None:
+            prev_matched, curr_matched, klt_des, klt_meta = klt
+            n_matches = len(prev_matched)
+        else:
+            # ---- ORB: detect + describe keypoints in the expanded search region ----
+            curr_pts_full, curr_des = self._detect_orb_in_region(gray, self.last_roi_bbox, frame.shape)
+            curr_meta = self._last_kp_meta
+            if curr_des is None or len(curr_pts_full) < MIN_ORB_KEYPOINTS:
+                self.orb_failure_count += 1
+                self.orb_prev_des = None
+                # Face likely no longer inside the local search region -- try
+                # global passport recovery before falling back to MediaPipe.
+                return self._fail_to_recovery(gray, frame, landmarker, timestamp_ms, "ORB_FAILURE")
 
-        # ---- ORB descriptor matching: previous frame vs current frame ----
-        try:
-            matches = self.matcher.match(self.orb_prev_des, curr_des)
-        except cv2.error:
-            matches = []
+            # ---- ORB descriptor matching: previous frame vs current frame ----
+            try:
+                matches = self.matcher.match(self.orb_prev_des, curr_des)
+            except cv2.error:
+                matches = []
 
-        if len(matches) < MIN_ORB_MATCHES:
-            self.orb_failure_count += 1
-            self.orb_prev_des = None
-            return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, "ORB_FAILURE", gray)
+            if len(matches) < MIN_ORB_MATCHES:
+                self.orb_failure_count += 1
+                self.orb_prev_des = None
+                return self._fail_to_recovery(gray, frame, landmarker, timestamp_ms, "ORB_FAILURE")
 
-        n_matches = len(matches)
-        prev_matched = np.float32([self.orb_prev_pts_full[m.queryIdx] for m in matches])
-        curr_matched = np.float32([curr_pts_full[m.trainIdx] for m in matches])
+            n_matches = len(matches)
+            prev_matched = np.float32([self.orb_prev_pts_full[m.queryIdx] for m in matches])
+            curr_matched = np.float32([curr_pts_full[m.trainIdx] for m in matches])
 
         # ---- RANSAC outlier rejection: fits a similarity transform
         # (translation + rotation + uniform scale), mapping PREVIOUS frame
@@ -1190,7 +1636,7 @@ class FaceROITracker:
         if M is None or inlier_mask is None:
             self.ransac_failure_count += 1
             self.orb_prev_des = None
-            return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, "RANSAC_FAILED", gray)
+            return self._fail_to_recovery(gray, frame, landmarker, timestamp_ms, "RANSAC_FAILED")
 
         inlier_idx = inlier_mask.ravel() == 1
         n_inliers = int(np.sum(inlier_idx))
@@ -1201,7 +1647,7 @@ class FaceROITracker:
             # a defensive floor, distinct from the reliability decision below
             self.ransac_failure_count += 1
             self.orb_prev_des = None
-            return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, "RANSAC_FAILED", gray)
+            return self._fail_to_recovery(gray, frame, landmarker, timestamp_ms, "RANSAC_FAILED")
 
         prev_inliers = prev_matched[inlier_idx]
         curr_inliers = curr_matched[inlier_idx]
@@ -1218,10 +1664,10 @@ class FaceROITracker:
         normalized_motion = median_displacement / roi_diagonal
 
         # ---- motion-threshold decision (classifies motion so the
-        # reliability bar can be raised for large motion, AND so the
-        # alignment warp is only actually applied for large motion). This
-        # alone never decides accept/reject -- see
-        # _motion_estimate_is_reliable() below, the ONE place that does. ----
+        # reliability bar can be raised for large motion). This alone never
+        # decides accept/reject -- see _motion_estimate_is_reliable()
+        # below, the ONE place that does. The monitor's SMALL/LARGE
+        # diagnostic makes this SAME comparison with the SAME threshold. ----
         is_large_motion = normalized_motion > self.motion_threshold
 
         # ---- single, explicit, multi-criterion reliability decision.
@@ -1231,111 +1677,160 @@ class FaceROITracker:
         # 10 inliers out of 12, even though the raw inlier count matches). ----
         reliable, failure_reason = self._motion_estimate_is_reliable(
             n_matches, n_inliers, inlier_ratio, is_large_motion)
+        # ADDED: inliers must be spatially spread (not clustered in a tiny
+        # area), otherwise rotation/scale of the fitted transform is unreliable.
+        if reliable:
+            spread = float(np.hypot(*np.ptp(prev_inliers, axis=0))) / roi_diagonal
+            if spread < MIN_INLIER_SPREAD_RATIO:
+                reliable = False
         if not reliable:
             self.ransac_failure_count += 1
             self.orb_prev_des = None
-            return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, "RANSAC_FAILED", gray)
+            return self._fail_to_recovery(gray, frame, landmarker, timestamp_ms, "RANSAC_FAILED")
 
-        # ---- decode translation + uniform scale from the RANSAC-fit
-        # similarity transform (rotation component intentionally not
-        # applied to the search-position rectangle below -- kept as an
-        # axis-aligned square, consistent with how it was defined) ----
-        a, b = float(M[0, 0]), float(M[1, 0])
-        scale = float(np.clip(np.hypot(a, b), SCALE_CLAMP[0], SCALE_CLAMP[1]))
-        translation = np.array([float(M[0, 2]), float(M[1, 2])], dtype=np.float64)
+        # ---- ADDED: chain this frame's PREVIOUS -> CURRENT transform onto
+        # the cumulative REFERENCE -> CURRENT transform:
+        #     T_new = M @ T_old        (reference -> previous -> current)
+        # and derive the current ROI rectangles from the FROZEN reference
+        # rectangles through T_new. This uses the full similarity (rotation
+        # included, applied to the patch CENTERS) and keeps the four
+        # patches' relative geometry exact. It is applied identically for
+        # small and large motion. An invalid transform (non-finite or scale
+        # outside SCALE_CLAMP), or any patch leaving the frame, is a
+        # GEOMETRY_REJECTED failure. ----
+        M3 = np.vstack([M, [0.0, 0.0, 1.0]]).astype(np.float64)
+        candidate_T = M3 @ self.reference_to_current
+        candidate_rects = None
+        if self._transform_is_valid(M3):
+            candidate_rects = self._rects_from_reference_transform(candidate_T, frame.shape)
 
-        candidate_rects = self._apply_rigid_transform_to_rects(
-            self.last_roi_rects, translation, scale, self.roi_center)
-
-        if not self._rois_in_bounds(candidate_rects, frame.shape):
+        if candidate_rects is None:
             self.ransac_failure_count += 1
             self.orb_prev_des = None
-            return self._run_mediapipe_detection(frame, landmarker, timestamp_ms, "GEOMETRY_REJECTED", gray)
+            # Invalid transform / tracked position left the frame -- try
+            # global passport recovery before falling back to MediaPipe.
+            return self._fail_to_recovery(gray, frame, landmarker, timestamp_ms, "GEOMETRY_REJECTED")
 
-        # ---- accept: update the SEARCH-POSITION tracker only (drives
-        # where ORB looks next frame) -- this is no longer the ROI that
-        # RGB gets read from. Chain the ORB reference forward to this
-        # frame for next frame's match, exactly as before. ----
+        # ---- accept: update ROI coordinates only (no image warp), chain
+        # the ORB reference forward to this frame for next frame's match ----
+        self.reference_to_current = candidate_T
         self.last_roi_rects = candidate_rects
-        _, self.last_roi_bbox = _mask_from_rects(frame.shape, candidate_rects)
-        self.roi_center = self._rects_center(candidate_rects)
-        self.orb_prev_pts_full = curr_pts_full
-        self.orb_prev_des = curr_des
+        mask, bbox = _mask_from_rects(frame.shape, candidate_rects)
+        self.last_roi_bbox = bbox
+        if klt is not None:
+            # ADDED: KLT frame. The surviving RANSAC inliers (with their
+            # validated current-frame descriptors) become the next frame's
+            # tracks. ORB is re-detected only if the track count has dropped
+            # below klt_redetect_ratio of the count at the last detection.
+            self.klt_frame_count += 1
+            self.orb_prev_pts_full = curr_matched[inlier_idx]
+            self.orb_prev_des = klt_des[inlier_idx]
+            self.orb_prev_meta = klt_meta[inlier_idx]
+            if len(self.orb_prev_pts_full) < self.klt_redetect_ratio * self.klt_ref_track_count:
+                pts_full, des = self._detect_orb_in_region(gray, bbox, frame.shape)
+                if des is not None and len(pts_full) >= MIN_ORB_KEYPOINTS:
+                    self.orb_prev_pts_full = pts_full
+                    self.orb_prev_des = des
+                    self.orb_prev_meta = self._last_kp_meta
+                    self.klt_ref_track_count = len(pts_full)
+                elif len(self.orb_prev_pts_full) < MIN_ORB_KEYPOINTS:
+                    self.orb_prev_des = None   # -> existing MediaPipe recovery next frame
+        else:
+            self.orb_prev_pts_full = curr_pts_full
+            self.orb_prev_des = curr_des
+            self.orb_prev_meta = curr_meta
+            self.klt_ref_track_count = len(curr_pts_full)
+        self.klt_prev_gray = gray
         self.orb_frame_count += 1
 
-        # ---- NEW: compose this frame's contribution into the running
-        # current-frame -> reference-frame transform. M maps PREVIOUS ->
-        # CURRENT, so alignment needs its INVERSE (CURRENT -> PREVIOUS),
-        # chained through whatever previously mapped PREVIOUS -> REFERENCE:
-        #     to_reference_transform_new = to_reference_transform_old @ inverse(M)
-        # This composition -- not M itself -- is what gets used to warp
-        # the current frame back into the reference coordinate system
-        # (spec §6: "the current frame needs the inverse mapping"). This
-        # is always updated (small motion included) so the transform stays
-        # accurate for whichever future frame first needs the actual warp;
-        # only the WARP ITSELF is skipped for small motion, per §8. ----
-        inv_M = cv2.invertAffineTransform(M)  # 2x3, CURRENT -> PREVIOUS
-        inv_M_3x3 = np.vstack([inv_M, [0.0, 0.0, 1.0]]).astype(np.float64)
-        self.to_reference_transform = self.to_reference_transform @ inv_M_3x3
-
-        alignment_applied = False
-        aligned_frame = None
-        if is_large_motion:
-            # ---- LARGE motion: align/warp the CURRENT RGB FRAME back into
-            # the reference coordinate system using INTER_NEAREST (spec
-            # §9/§10/§11). The FIXED reference ROI is read from the result
-            # below by the caller -- never from a moved ROI rectangle. ----
-            warp_2x3 = self.to_reference_transform[:2, :].astype(np.float32)
-            h, w = frame.shape[:2]
-            aligned_frame = cv2.warpAffine(
-                frame, warp_2x3, (w, h), flags=cv2.INTER_NEAREST,
-            )
-            alignment_applied = True
-        # else: SMALL motion -- no warp; the fixed reference ROI is read
-        # directly from the raw current frame (spec §8).
-
-        return (aligned_frame, self.reference_mask, self.reference_bbox, "ORB", None,
-                median_displacement, normalized_motion, n_matches, n_inliers, inlier_ratio,
-                alignment_applied)
+        return mask, bbox, "ORB", None, median_displacement, normalized_motion, n_matches, n_inliers, inlier_ratio
 
 
 def process_single_frame(frame, roi_tracker, landmarker, timestamp_ms,
                           use_color_skin_mask=True, image_show=False):
     """Per-frame ROI acquisition (via roi_tracker) followed by the
-    UNCHANGED mean_skin_rgb() call. The fixed reference ROI is always
-    read from either the raw current frame (small motion / MediaPipe
-    frames) or the current frame ALIGNED back into the reference
-    coordinate system (large motion) -- never from a ROI rectangle that
-    moved to follow the face.
+    UNCHANGED mean_skin_rgb() call -- whichever mechanism (MediaPipe/ORB)
+    supplied the ROI this frame, the actual pixel values are always read
+    fresh from the raw current frame here -- never from a warped/
+    interpolated image.
 
     Returns (rgb_or_None, mode: str, reason: str_or_None,
              median_displacement: float_or_None, normalized_motion: float_or_None,
              n_matches: int_or_None, n_inliers: int_or_None, inlier_ratio: float_or_None,
-             alignment_applied: bool).
+             roi_quality: dict).
     """
-    (aligned_frame, mask, bbox, mode, reason, median_displacement, normalized_motion,
-     n_matches, n_inliers, inlier_ratio, alignment_applied) = \
+    mask, bbox, mode, reason, median_displacement, normalized_motion, n_matches, n_inliers, inlier_ratio = \
         roi_tracker.process(frame, landmarker, timestamp_ms)
 
-    # The fixed reference ROI is read from the aligned frame when alignment
-    # was applied this frame, otherwise straight from the raw current frame.
-    extraction_frame = aligned_frame if aligned_frame is not None else frame
+    # ===== ADDED: per-patch ROI quality monitoring / dynamic patch selection =====
+    # Checks each of the four physiological patches at its CURRENT-frame
+    # location (roi_tracker.last_roi_rects -- the same rectangles whose union
+    # already produced `mask`/`bbox` above, whichever of MediaPipe/ORB/passport
+    # supplied them) and only narrows which pixels get handed to the
+    # existing, unmodified mean_skin_rgb() below. Falls back to the full
+    # four-patch union if every patch looks unreliable this frame -- never
+    # touches mean_skin_rgb(), build_roi_mask(), or POS.
+    roi_quality = {}
+    if roi_tracker.last_roi_rects is not None and mask is not None and bbox is not None:
+        sel_mask, sel_bbox, roi_quality = select_valid_roi_mask(
+            frame, roi_tracker.last_roi_rects, frame.shape,
+            use_color_skin_mask=use_color_skin_mask)
+        if sel_mask is not None and sel_bbox is not None:
+            mask, bbox = sel_mask, sel_bbox
 
     rgb = None
     if mask is not None and bbox is not None:
         bx, by, bw, bh = bbox
         if bw > 0 and bh > 0:
-            face_crop = extraction_frame[by:by + bh, bx:bx + bw]
+            face_crop = frame[by:by + bh, bx:bx + bw]
             mask_crop = mask[by:by + bh, bx:bx + bw]
             if face_crop.size > 0:
                 rgb = mean_skin_rgb(face_crop, mask_crop, use_color_skin_mask)  # UNCHANGED
-            if image_show:
-                # Drawn on the raw display frame (not the aligned buffer) so
-                # the on-screen rectangle still tracks visually with the face.
-                color = {"MEDIAPIPE": (0, 255, 0), "ORB": (255, 200, 0)}.get(mode, (0, 0, 255))
-                cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), color, 2)
+            # (display drawing removed from the processing path: all drawing now
+            # happens on COPIES in build_alignment_view(), so `frame` is never modified)
 
-    return rgb, mode, reason, median_displacement, normalized_motion, n_matches, n_inliers, inlier_ratio, alignment_applied
+    return (rgb, mode, reason, median_displacement, normalized_motion, n_matches, n_inliers,
+            inlier_ratio, roi_quality)
+
+
+# ===== VISUALIZATION ONLY (added) ==========================================
+# Debug/display layer. Draws ONLY on COPIES of the frame; never feeds
+# mean_skin_rgb(), POS, filtering, HR or SNR.
+#   LEFT : raw/current camera frame + the four CURRENT (moving) ROIs.
+#   RIGHT: the current frame warped into the reference coordinate system
+#          (inverse of the cumulative reference->current transform) with the
+#          four FIXED reference ROIs drawn. If the ROIs follow the face
+#          correctly, the face stays put under these boxes while you move.
+#          When no transform has been applied (identity, e.g. right after a
+#          MediaPipe detection) this is simply the current frame.
+VIZ_ROI_COLOR = (0, 255, 0)
+VIZ_ROI_THICKNESS = 2
+
+
+def _viz_draw_rois(img, rects):
+    # Same rounding as _mask_from_rects(), so the drawn rectangles match the mask.
+    for (x, y, w, h) in rects.values():
+        cv2.rectangle(img, (int(round(x)), int(round(y))),
+                      (int(round(x + w)), int(round(y + h))),
+                      VIZ_ROI_COLOR, VIZ_ROI_THICKNESS)
+
+
+def build_alignment_view(current_frame, roi_tracker):
+    left = current_frame.copy()
+    if roi_tracker.last_roi_rects is not None:
+        _viz_draw_rois(left, roi_tracker.last_roi_rects)
+
+    T = roi_tracker.reference_to_current
+    if np.allclose(T, np.eye(3)):
+        right = current_frame.copy()
+    else:
+        inv = cv2.invertAffineTransform(T[:2, :].astype(np.float64))
+        h, w = current_frame.shape[:2]
+        right = cv2.warpAffine(current_frame, inv, (w, h), flags=cv2.INTER_LINEAR)
+    if roi_tracker.reference_rois is not None:
+        _viz_draw_rois(right, roi_tracker.reference_rois)
+    return np.hstack((left, right))
+# ===== end VISUALIZATION ONLY ==============================================
 
 
 def _gui_available():
@@ -1386,7 +1881,9 @@ def main():
     ap.add_argument("--buffer_seconds", type=float, default=10.0,
                      help="width of the rolling window in seconds (default 10s)")
     ap.add_argument("--image_show", action="store_true",
-                     help="show a live window with the camera feed and HR overlay")
+                     help="show one live debug window: LEFT = raw/current frame with the "
+                          "four current ROIs, RIGHT = frame aligned to the "
+                          "reference with the four reference ROIs")
     ap.add_argument("--fourcc", default="MJPG",
                      help="pixel format to explicitly request from the "
                           "camera. Default 'MJPG' -- the camera's normal "
@@ -1408,21 +1905,26 @@ def main():
                           "outlier rejection, escalating validation "
                           "requirements when normalized motion (median "
                           "RANSAC-inlier displacement / ROI diagonal) "
-                          "exceeds --motion_threshold, with MediaPipe "
-                          "recovery only if ORB/RANSAC cannot reliably "
-                          "maintain tracking. 'none' disables tracking and "
-                          "runs MediaPipe on every frame.")
+                          "exceeds --motion_threshold, with global ORB "
+                          "passport recovery and then MediaPipe recovery "
+                          "only if ORB/RANSAC cannot reliably maintain the "
+                          "ROI. 'none' disables tracking and runs "
+                          "MediaPipe on every frame.")
     ap.add_argument("--motion_threshold", type=float, default=MOTION_THRESHOLD,
                      help="normalized-motion threshold (median RANSAC-inlier "
                           "displacement / ROI diagonal) above which motion "
-                          "is classified LARGE: a stricter RANSAC-inlier "
+                          "is classified LARGE and a stricter RANSAC-inlier "
                           "minimum is required before the estimate is "
-                          "trusted, and (if trusted) the current frame is "
-                          "actually warped back into the reference "
-                          "coordinate system. Below this threshold the "
-                          "fixed reference ROI is read straight from the "
-                          "raw current frame with no warp. Tune "
-                          "experimentally.")
+                          "trusted. The same value drives the tracker and "
+                          "the SMALL/LARGE diagnostic. Default "
+                          "%(default)s (fraction of the ROI diagonal); "
+                          "tune experimentally.")
+    ap.add_argument("--no_klt", action="store_true",
+                     help="disable the KLT tracking layer (ORB detect+match every frame)")
+    ap.add_argument("--klt_redetect_ratio", type=float, default=KLT_REDETECT_RATIO,
+                     help="re-detect ORB keypoints when the KLT track count falls "
+                          "below this fraction of the count at the last "
+                          "detection. Default %(default)s.")
     ap.add_argument("--verbose_frames", action="store_true",
                      help="print a diagnostic line for every single frame "
                           "(frame number, elapsed time, fps, mode, and, on "
@@ -1458,14 +1960,13 @@ def main():
     tracker_kind = None if args.tracker == "none" else args.tracker
     if tracker_kind is not None:
         print(f"OpenCV version: {cv2.__version__}")
-        print("Tracking architecture: MediaPipe init (freezes fixed reference "
-              "ROI) -> ORB + RANSAC motion estimate -> "
+        print("Tracking architecture: MediaPipe init -> KLT (+ORB descriptor validation) / ORB -> RANSAC -> "
               f"(normalized motion > {args.motion_threshold * 100:.2f}% of "
-              "ROI diagonal: stricter RANSAC-inlier validation, then warp "
-              "the current frame back into the reference coordinate system "
-              "with INTER_NEAREST) -> fixed reference ROI read from the "
-              "raw or aligned frame -> MediaPipe recovery only if ORB/RANSAC "
-              "cannot reliably maintain tracking. "
+              "ROI diagonal: stricter RANSAC-inlier validation) -> ROI "
+              "coordinates recomputed from the frozen reference ROI through "
+              "the cumulative reference->current transform -> ORB resumes -> "
+              "global ORB passport recovery, then MediaPipe recovery, only if "
+              "necessary. "
               "(cv2.ORB_create / cv2.BFMatcher / cv2.estimateAffinePartial2D "
               "all ship with core opencv-python, no opencv-contrib-python "
               "required.)")
@@ -1474,7 +1975,9 @@ def main():
     print(f"Tracker: {tracker_label}")
 
     roi_tracker = FaceROITracker(tracker_kind=tracker_kind, max_gap=args.max_gap,
-                                  motion_threshold=args.motion_threshold)
+                                  motion_threshold=args.motion_threshold,
+                                  klt_enabled=not args.no_klt,
+                                  klt_redetect_ratio=args.klt_redetect_ratio)
 
     monitor = RealTimeHeartRateMonitor(
         framerate=args.framerate,
@@ -1521,7 +2024,7 @@ def main():
             last_timestamp_ms = timestamp_ms
 
             (rgb, mode, reason, median_displacement, normalized_motion, n_matches,
-             n_inliers, inlier_ratio, alignment_applied) = \
+             n_inliers, inlier_ratio, roi_quality) = \
                 process_single_frame(
                     frame, roi_tracker, landmarker, timestamp_ms,
                     use_color_skin_mask=not args.no_color_skin_mask,
@@ -1538,8 +2041,7 @@ def main():
                                        median_displacement=median_displacement,
                                        normalized_motion=normalized_motion,
                                        n_matches=n_matches, n_inliers=n_inliers,
-                                       inlier_ratio=inlier_ratio,
-                                       alignment_applied=alignment_applied)
+                                       inlier_ratio=inlier_ratio)
 
             frame_number += 1
             recent_frame_times.append(loop_start)
@@ -1555,27 +2057,24 @@ def main():
             mode_str = mode if mode else "MEDIAPIPE"
             if args.verbose_frames:
                 elapsed_total = time.time() - monitor.start_time
-                align_str = "ALIGNED" if alignment_applied else "raw"
                 print(f"frame={frame_number:<6d} time={elapsed_total:6.2f}s   "
-                      f"fps={current_fps:5.1f}   mode={mode_str}   frame={align_str}")
+                      f"fps={current_fps:5.1f}   mode={mode_str}")
                 if reason not in (None, "INITIAL"):
                     recovered = roi_tracker.orb_prev_des is not None
                     print(f"          reason={reason}  "
                           f"recovery={'SUCCESS' if recovered else 'FAILED'}")
+                # ADDED: which physiological patches (if any) were excluded
+                # this frame by the ROI quality monitor.
+                excluded = [name for name, ok in roi_quality.items() if not ok]
+                if excluded:
+                    print(f"          roi_excluded={','.join(excluded)}")
 
             if image_show:
-                elapsed = time.time() - monitor.start_time
-                if monitor.current_hr is not None:
-                    label = f"HR: {monitor.current_hr:.1f} bpm  [{mode_str}]"
-                    color = (0, 255, 0)
-                else:
-                    remaining = max(0.0, args.start_display_at - elapsed)
-                    label = f"Collecting baseline... {remaining:.1f}s  [{mode_str}]"
-                    color = (0, 165, 255)
-                cv2.putText(frame, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.9, color, 2, cv2.LINE_AA)
+                # Two panels in ONE window, no text overlays: LEFT raw/current
+                # frame + current ROIs | RIGHT aligned frame + reference ROIs.
                 try:
-                    cv2.imshow("Real-time rPPG", frame)
+                    cv2.imshow("Current frame | Aligned frame",
+                               build_alignment_view(frame, roi_tracker))
                     if cv2.waitKey(1) & 0xFF == ord("q"):
                         break
                 except cv2.error as e:
@@ -1628,13 +2127,14 @@ def main():
     print(f"MediaPipe re-detections:    {roi_tracker.redetect_count}")
     print(f"ORB failures:               {roi_tracker.orb_failure_count}")
     print(f"RANSAC failures:            {roi_tracker.ransac_failure_count}")
+    print(f"Global passport recoveries: {roi_tracker.passport_recovery_count}")  # ADDED
+    print(f"KLT-tracked frames:         {roi_tracker.klt_frame_count}")  # ADDED
     print()
     avg_matches_all = statistics.mean(monitor.n_matches_history) if monitor.n_matches_history else None
     avg_inliers_all = statistics.mean(monitor.n_inliers_history) if monitor.n_inliers_history else None
     avg_inlier_ratio_all = statistics.mean(monitor.inlier_ratio_history) if monitor.inlier_ratio_history else None
     avg_disp_all = statistics.mean(monitor.disp_history) if monitor.disp_history else None
     avg_norm_motion_all = statistics.mean(monitor.norm_motion_history) if monitor.norm_motion_history else None
-    avg_alignment_all = statistics.mean(monitor.alignment_history) if monitor.alignment_history else None
     print(f"Avg valid ORB matches:      "
           f"{avg_matches_all:.1f}" if avg_matches_all is not None else "Avg valid ORB matches:      n/a")
     print(f"Avg RANSAC inliers:         "
@@ -1645,8 +2145,6 @@ def main():
           f"{avg_disp_all:.2f} px" if avg_disp_all is not None else "Avg median displacement:    n/a")
     print(f"Avg normalized motion:      "
           f"{avg_norm_motion_all * 100.0:.1f} %" if avg_norm_motion_all is not None else "Avg normalized motion:      n/a")
-    print(f"Avg frame alignment applied: "
-          f"{avg_alignment_all * 100.0:.1f} %" if avg_alignment_all is not None else "Avg frame alignment applied: n/a")
     print()
     print(f"Average HR:                 "
           f"{avg_hr:.2f} BPM" if avg_hr is not None else "Average HR:                 n/a")
